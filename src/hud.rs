@@ -42,10 +42,23 @@ const BARS: usize = 5;
 const BAR_W: f32 = 3.0;
 const BAR_GAP: f32 = 3.0;
 const BARS_W: f32 = BARS as f32 * BAR_W + (BARS - 1) as f32 * BAR_GAP;
+const BAR_MIN_H: f32 = 4.0;
+const BAR_MAX_H: f32 = 16.0;
 const PULSE_PERIOD: f32 = 1.4;
+/// How fast the meter follows the input level, per second. It rises quickly
+/// with speech and falls back more slowly, like a VU meter.
+const METER_ATTACK: f32 = 30.0;
+const METER_RELEASE: f32 = 8.0;
 
+enum Msg {
+    Show,
+    Hide,
+    Level(f32),
+}
+
+#[derive(Clone)]
 pub struct Hud {
-    tx: Sender<bool>,
+    tx: Sender<Msg>,
 }
 
 impl Hud {
@@ -62,15 +75,20 @@ impl Hud {
     }
 
     pub fn show(&self) {
-        let _ = self.tx.send(true);
+        let _ = self.tx.send(Msg::Show);
     }
 
     pub fn hide(&self) {
-        let _ = self.tx.send(false);
+        let _ = self.tx.send(Msg::Hide);
+    }
+
+    /// Sets the mic level the bars show, from 0.0 (flat) to 1.0 (full height).
+    pub fn set_level(&self, level: f32) {
+        let _ = self.tx.send(Msg::Level(level));
     }
 }
 
-fn run(rx: Channel<bool>) -> anyhow::Result<()> {
+fn run(rx: Channel<Msg>) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
@@ -79,8 +97,12 @@ fn run(rx: Channel<bool>) -> anyhow::Result<()> {
     event_loop
         .handle()
         .insert_source(rx, |event, _, state| {
-            if let channel::Event::Msg(show) = event {
-                if show { state.show() } else { state.hide() }
+            if let channel::Event::Msg(msg) = event {
+                match msg {
+                    Msg::Show => state.show(),
+                    Msg::Hide => state.hide(),
+                    Msg::Level(level) => state.target_level = level,
+                }
             }
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -97,7 +119,10 @@ fn run(rx: Channel<bool>) -> anyhow::Result<()> {
         layer: None,
         scale: 1,
         started: Instant::now(),
+        last_frame: Instant::now(),
         frame_pending: false,
+        level: 0.0,
+        target_level: 0.0,
         font: FontRef::try_from_slice(FONT)?,
     };
     loop {
@@ -117,7 +142,12 @@ struct HudState {
     layer: Option<LayerSurface>,
     scale: i32,
     started: Instant,
+    last_frame: Instant,
     frame_pending: bool,
+    /// The level the bars currently show, easing toward `target_level`.
+    level: f32,
+    /// The latest mic level from the recorder.
+    target_level: f32,
     font: FontRef<'static>,
 }
 
@@ -155,7 +185,9 @@ impl HudState {
         let (w, h) = self.surface_size();
         layer.set_size(w, h);
         self.started = Instant::now();
+        self.last_frame = self.started;
         self.frame_pending = false;
+        (self.level, self.target_level) = (0.0, 0.0);
         // First commit has no buffer; we draw once the compositor configures us.
         layer.commit();
         self.layer = Some(layer);
@@ -175,6 +207,10 @@ impl HudState {
         let Some(mut pixmap) = Pixmap::new(w * s, h * s) else { return };
         let t = Transform::from_scale(s as f32, s as f32);
         let time = self.started.elapsed().as_secs_f32();
+        let dt = self.last_frame.elapsed().as_secs_f32();
+        self.last_frame = Instant::now();
+        let rate = if self.target_level > self.level { METER_ATTACK } else { METER_RELEASE };
+        self.level += (self.target_level - self.level) * (rate * dt).min(1.0);
         let (pw, ph) = (self.pill_width(), HEIGHT as f32);
         let cy = ph / 2.0;
         let pill_t = t.pre_translate(SHADOW, SHADOW);
@@ -229,14 +265,16 @@ impl HudState {
         let label_x = dot_x + 14.0;
         draw_text(&mut pixmap, &self.font, LABEL, SHADOW + label_x, SHADOW + cy, s as f32);
 
-        // Animated level bars. There's no audio level plumbed through, so this
-        // is a decorative "listening" indicator.
-        paint.shader = tiny_skia::Shader::SolidColor(Color::from_rgba8(255, 255, 255, 170));
+        // Level bars driven by the mic. Their height scales with loudness, and
+        // each bar wobbles a little so speech looks alive; with no input (silence
+        // or a muted mic) they lie flat and dim.
+        let level = self.level;
+        paint.shader = tiny_skia::Shader::SolidColor(Color::from_rgba8(255, 255, 255, (90.0 + 110.0 * level) as u8));
         let bars_x = label_x + self.label_width() + 14.0;
         for i in 0..BARS {
             let f = i as f32;
             let wave = 0.5 * (time * 5.3 + f * 1.4).sin() + 0.5 * (time * 3.1 + f * 2.3).sin();
-            let bar_h = 5.0 + 11.0 * (0.5 + 0.5 * wave);
+            let bar_h = BAR_MIN_H + (BAR_MAX_H - BAR_MIN_H) * level * (0.75 + 0.25 * wave);
             let x = bars_x + f * (BAR_W + BAR_GAP);
             if let Some(bar) = rounded_rect(BAR_W, bar_h, BAR_W / 2.0) {
                 pixmap.fill_path(&bar, &paint, FillRule::Winding, pill_t.pre_translate(x, cy - bar_h / 2.0), None);

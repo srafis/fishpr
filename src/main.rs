@@ -307,7 +307,10 @@ async fn main() -> Result<()> {
         let Some(event) = events.recv().await else { break };
         match (event, recording.take()) {
             (Event::Quit, _) => quit = true,
-            (Event::Toggle | Event::Start, None) => match Recording::start(&path) {
+            (Event::Toggle | Event::Start, None) => match Recording::start(&path, {
+                let hud = ui.hud.clone();
+                move |level| hud.set_level(level)
+            }) {
                 Ok(r) => {
                     recording = Some(r);
                     ui.set(State::Recording).await;
