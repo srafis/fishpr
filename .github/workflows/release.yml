@@ -2,8 +2,12 @@
 #   1. build the binary and attach fishpr-<ver>-x86_64.tar.gz to the v0.2.0 release
 #   2. build fishpr-bin from packaging/fishpr-bin/PKGBUILD and sign it
 #   3. publish it to the pacman repo stored in the `repo` release
+#   4. build fishpr_<ver>_amd64.deb on Ubuntu 24.04 (its glibc is the oldest we
+#      support), attach it to the v0.2.0 release, and publish it to the apt repo
+#      stored in the `apt` release
 #
 # Needs the GPG_PRIVATE_KEY secret: an armored, passphrase-less signing key.
+# Both repos are signed with it.
 
 name: Release
 
@@ -25,6 +29,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
+      # whisper.cpp otherwise builds for the CI machine's CPU (-march=native),
+      # which can crash with "illegal instruction" on older CPUs.
+      GGML_NATIVE: 'OFF'
     steps:
       - name: Install build tools
         run: pacman -Syu --noconfirm --needed rust cmake clang git github-cli
@@ -48,7 +55,7 @@ jobs:
       - name: Upload tarball
         run: |
           mkdir -p "dist/$TARBALL"
-          cp target/release/fishpr packaging/fishpr.desktop packaging/60-fishpr-uinput.rules \
+          cp target/release/fishpr packaging/io.github.srafis.fishpr.desktop packaging/60-fishpr-uinput.rules \
              LICENSE assets/NotoSans-OFL.txt "dist/$TARBALL/"
           cp assets/icon-idle.png "dist/$TARBALL/fishpr.png"
           tar -C dist -czf "dist/$TARBALL.tar.gz" "$TARBALL"
@@ -98,5 +105,82 @@ jobs:
             case "$asset" in
               "$package" | "$package.sig") ;;
               fishpr-bin-*.pkg.tar.zst*) gh release delete-asset repo "$asset" --yes ;;
+            esac
+          done
+
+  deb:
+    # After `release`, which creates the v<ver> GitHub release this uploads to.
+    needs: release
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      GGML_NATIVE: 'OFF'
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential cmake clang libclang-dev \
+            dpkg-dev apt-utils binutils gnupg gh
+          # Ubuntu's own Rust is too old for edition 2024.
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: |
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          cargo build --release --locked
+
+      - name: Build package
+        run: |
+          mkdir -p dist/stage
+          cp target/release/fishpr packaging/io.github.srafis.fishpr.desktop packaging/60-fishpr-uinput.rules \
+             LICENSE assets/NotoSans-OFL.txt dist/stage/
+          cp assets/icon-idle.png dist/stage/fishpr.png
+          sh packaging/deb/build.sh "$VERSION" dist/stage dist
+          gh release upload "$TAG" "dist/fishpr_${VERSION}_amd64.deb" --clobber
+
+      - name: Sign and publish to the apt repo
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::error::the GPG_PRIVATE_KEY secret isn't set"
+            exit 1
+          fi
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          fpr=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ { print $10; exit }')
+
+          # A flat repo (no dists/ tree), since release assets can't have paths:
+          #   deb https://github.com/<repo>/releases/download/apt/ ./
+          deb="fishpr_${VERSION}_amd64.deb"
+          mkdir apt
+          cp "dist/$deb" apt/
+          cd apt
+          dpkg-scanpackages --multiversion . /dev/null > Packages
+          gzip -9kn Packages
+          # Written outside the directory so it doesn't list a checksum of itself.
+          apt-ftparchive -o APT::FTPArchive::Release::Origin=fishpr -o APT::FTPArchive::Release::Label=fishpr \
+            release . > ../Release
+          mv ../Release .
+          gpg --batch --local-user "$fpr" --digest-algo SHA512 --clearsign -o InRelease Release
+          gpg --batch --local-user "$fpr" --digest-algo SHA512 --armor --detach-sign -o Release.gpg Release
+          gpg --armor --export "$fpr" > fishpr.gpg
+
+          gh release view apt >/dev/null 2>&1 || gh release create apt --latest=false \
+            --title "apt repo" --notes "Storage for fishpr's apt repo. Install with install.sh in the repo root."
+          # Package first, then the index that points at it, so clients never see a missing file.
+          gh release upload apt "$deb" --clobber
+          gh release upload apt Packages Packages.gz Release Release.gpg InRelease fishpr.gpg --clobber
+
+          gh release view apt --json assets --jq '.assets[].name' | while read -r asset; do
+            case "$asset" in
+              "$deb") ;;
+              fishpr_*.deb) gh release delete-asset apt "$asset" --yes ;;
             esac
           done

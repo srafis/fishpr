@@ -1,6 +1,6 @@
 # AGENTS.md
 
-fishpr is push-to-talk dictation for KDE Plasma 6 on Wayland, written in Rust. [README.md](README.md) explains what it does and lists what each file in `src/` does.
+fishpr is push-to-talk dictation for KDE Plasma 6 and GNOME on Wayland, written in Rust. [README.md](README.md) explains what it does and lists what each file in `src/` does.
 
 ## Build and test
 
@@ -15,4 +15,4 @@ Match the surrounding code. There's no `rustfmt.toml`, and the lines are wider t
 
 ## Releases
 
-fishpr is distributed as `fishpr-bin` through a signed pacman repo that CI publishes from `v*` tags. To make a release, follow [.agents/skills/release/SKILL.md](.agents/skills/release/SKILL.md). Don't change the `repo` release, the package name, or the signing key: installed systems depend on all three.
+fishpr is distributed through two signed repos that CI publishes from `v*` tags: `fishpr-bin` in a pacman repo (the `repo` release) and `fishpr` in an apt repo (the `apt` release). To make a release, follow [.agents/skills/release/SKILL.md](.agents/skills/release/SKILL.md). Don't change either release, the package names, the signing key, or the app ID `io.github.srafis.fishpr`: installed systems depend on all of them.

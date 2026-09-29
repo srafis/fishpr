@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+    # Apply the uinput rule now, so silent pasting works without logging out.
+    udevadm control --reload 2>/dev/null || true
+    udevadm trigger --action=change --name-match=uinput 2>/dev/null || true
+fi

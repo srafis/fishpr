@@ -5,12 +5,13 @@
 pkgname=fishpr-bin
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Push-to-talk dictation for KDE Plasma'
+pkgdesc='Push-to-talk dictation for KDE Plasma and GNOME'
 arch=('x86_64')
 url='https://github.com/srafis/fishpr'
 license=('MIT' 'OFL-1.1')  # OFL covers the bundled Noto Sans font
 depends=('glibc' 'libgcc' 'libstdc++' 'pipewire-audio' 'wl-clipboard' 'libnotify')
-optdepends=('xclip: clipboard on X11')
+optdepends=('xclip: clipboard on X11'
+            'gnome-shell-extension-appindicator: tray icon on GNOME')
 provides=('fishpr')
 conflicts=('fishpr')
 options=('!debug')  # the release profile already strips the binary
@@ -21,8 +22,8 @@ sha256sums=('SKIP')
 package() {
   cd "fishpr-$pkgver-x86_64"
   install -Dm755 fishpr -t "$pkgdir/usr/bin"
-  install -Dm644 fishpr.desktop -t "$pkgdir/usr/share/applications"
-  install -Dm644 fishpr.desktop -t "$pkgdir/etc/xdg/autostart"
+  install -Dm644 io.github.srafis.fishpr.desktop -t "$pkgdir/usr/share/applications"
+  install -Dm644 io.github.srafis.fishpr.desktop -t "$pkgdir/etc/xdg/autostart"
   install -Dm644 60-fishpr-uinput.rules -t "$pkgdir/usr/lib/udev/rules.d"
   install -Dm644 fishpr.png -t "$pkgdir/usr/share/pixmaps"
   install -Dm644 LICENSE NotoSans-OFL.txt -t "$pkgdir/usr/share/licenses/$pkgname"

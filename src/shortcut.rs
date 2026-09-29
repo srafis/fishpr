@@ -1,10 +1,17 @@
-//! Global push-to-talk shortcut via KDE's KGlobalAccel (built into KWin).
+//! Global push-to-talk shortcut. Both backends report press *and* release,
+//! which is what hold-to-talk needs, and register Ctrl+Space only as the
+//! *default*, so a user's rebinding sticks.
 //!
-//! KGlobalAccel reports both press and release, which is what hold-to-talk
-//! needs. Ctrl+Space is registered as the *default*, so users can rebind it in
-//! System Settings → Shortcuts → fishpr and the choice sticks.
+//! - KDE Plasma: KGlobalAccel (built into KWin). Rebind in System Settings →
+//!   Shortcuts → fishpr.
+//! - Everywhere else: the XDG GlobalShortcuts portal (GNOME 48 and later). The
+//!   desktop asks the user to approve the shortcut the first time.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use ashpd::desktop::{
+    Session,
+    global_shortcuts::{GlobalShortcuts, NewShortcut},
+};
 use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::zvariant::OwnedObjectPath;
@@ -13,9 +20,12 @@ use crate::Event;
 
 const COMPONENT: &str = "fishpr";
 const ACTION: &str = "push-to-talk";
+const DESCRIPTION: &str = "Push to talk (hold)";
 
 // Qt key codes: Qt::ControlModifier | Qt::Key_Space.
 const CTRL_SPACE: i32 = 0x0400_0000 | 0x20;
+// The same keys in the portal's trigger syntax.
+const CTRL_SPACE_TRIGGER: &str = "CTRL+space";
 
 // kglobalacceld's SetShortcutFlag values.
 const SET_PRESENT: u32 = 2;
@@ -46,45 +56,108 @@ trait Component {
     fn global_shortcut_released(&self, component_unique: String, shortcut_unique: String, timestamp: i64) -> zbus::Result<()>;
 }
 
-/// Keeps the shortcut registered; call `unregister` before exiting so KWin
-/// stops grabbing the keys while fishpr isn't running.
-pub struct Shortcut {
-    accel: KGlobalAccelProxy<'static>,
+/// Keeps the shortcut registered; call `unregister` before exiting so the
+/// desktop stops grabbing the keys while fishpr isn't running.
+pub struct Shortcut(Backend);
+
+enum Backend {
+    Kde(KGlobalAccelProxy<'static>),
+    Portal(Session<GlobalShortcuts>),
 }
 
 fn action_id() -> [&'static str; 4] {
-    [COMPONENT, ACTION, "fishpr", "Push to talk (hold)"]
+    [COMPONENT, ACTION, "fishpr", DESCRIPTION]
 }
 
 impl Shortcut {
     pub async fn register(events: UnboundedSender<Event>) -> Result<Self> {
         let conn = zbus::Connection::session().await?;
-        let accel = KGlobalAccelProxy::new(&conn).await.context("connecting to KGlobalAccel")?;
-        let id = action_id();
-        accel.do_register(&id).await?;
-        accel.set_shortcut_keys(&id, &[(vec![CTRL_SPACE],)], IS_DEFAULT).await?;
-        accel.set_shortcut_keys(&id, &[(vec![CTRL_SPACE],)], SET_PRESENT).await?;
-
-        let path = accel.get_component(COMPONENT).await?;
-        let component = ComponentProxy::builder(&conn).path(path)?.build().await?;
-        let mut pressed = component.receive_global_shortcut_pressed().await?;
-        let mut released = component.receive_global_shortcut_released().await?;
-        tokio::spawn(async move {
-            loop {
-                let (signal, event) = tokio::select! {
-                    Some(s) = pressed.next() => (s.args().map(|a| a.shortcut_unique == ACTION), Event::Start),
-                    Some(s) = released.next() => (s.args().map(|a| a.shortcut_unique == ACTION), Event::Stop),
-                    else => break,
-                };
-                if matches!(signal, Ok(true)) && events.send(event).is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(Self { accel })
+        if is_kde(&conn).await { register_kde(&conn, events).await } else { register_portal(events).await }
     }
 
     pub async fn unregister(&self) {
-        let _ = self.accel.set_inactive(&action_id()).await;
+        match &self.0 {
+            Backend::Kde(accel) => {
+                let _ = accel.set_inactive(&action_id()).await;
+            }
+            Backend::Portal(session) => {
+                let _ = session.close().await;
+            }
+        }
     }
+}
+
+/// Decides by the desktop, not by whether KGlobalAccel answers: D-Bus would
+/// happily start kglobalacceld on GNOME too, and it would never see a key.
+async fn is_kde(conn: &zbus::Connection) -> bool {
+    match std::env::var("XDG_CURRENT_DESKTOP") {
+        Ok(desktops) => desktops.split(':').any(|d| d.eq_ignore_ascii_case("KDE")),
+        // Some launchers drop the variable; a running kglobalacceld means Plasma.
+        Err(_) => match zbus::fdo::DBusProxy::new(conn).await {
+            Ok(dbus) => dbus.name_has_owner("org.kde.kglobalaccel".try_into().unwrap()).await.unwrap_or(false),
+            Err(_) => false,
+        },
+    }
+}
+
+async fn register_kde(conn: &zbus::Connection, events: UnboundedSender<Event>) -> Result<Shortcut> {
+    let accel = KGlobalAccelProxy::new(conn).await.context("connecting to KGlobalAccel")?;
+    let id = action_id();
+    accel.do_register(&id).await?;
+    accel.set_shortcut_keys(&id, &[(vec![CTRL_SPACE],)], IS_DEFAULT).await?;
+    accel.set_shortcut_keys(&id, &[(vec![CTRL_SPACE],)], SET_PRESENT).await?;
+
+    let path = accel.get_component(COMPONENT).await?;
+    let component = ComponentProxy::builder(conn).path(path)?.build().await?;
+    let mut pressed = component.receive_global_shortcut_pressed().await?;
+    let mut released = component.receive_global_shortcut_released().await?;
+    tokio::spawn(async move {
+        loop {
+            let (signal, event) = tokio::select! {
+                Some(s) = pressed.next() => (s.args().map(|a| a.shortcut_unique == ACTION), Event::Start),
+                Some(s) = released.next() => (s.args().map(|a| a.shortcut_unique == ACTION), Event::Stop),
+                else => break,
+            };
+            if matches!(signal, Ok(true)) && events.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(Shortcut(Backend::Kde(accel)))
+}
+
+/// The first bind shows the desktop's "allow global shortcut" dialog; the
+/// desktop remembers the answer (and any rebinding) per app ID.
+async fn register_portal(events: UnboundedSender<Event>) -> Result<Shortcut> {
+    let portal = GlobalShortcuts::new().await.context("this desktop has no global shortcuts portal")?;
+    let session = portal.create_session(Default::default()).await.context("starting a global shortcuts session")?;
+    let mut activated = portal.receive_activated().await?;
+    let mut deactivated = portal.receive_deactivated().await?;
+
+    let shortcut = NewShortcut::new(ACTION, DESCRIPTION).preferred_trigger(CTRL_SPACE_TRIGGER);
+    let bound = portal
+        .bind_shortcuts(&session, &[shortcut], None, Default::default())
+        .await?
+        .response()
+        .context("the shortcut was not approved")?;
+    let Some(bound) = bound.shortcuts().iter().find(|s| s.id() == ACTION) else {
+        let _ = session.close().await;
+        bail!("the shortcut was not approved");
+    };
+    eprintln!("fishpr: push to talk is bound to {}", bound.trigger_description());
+
+    // Only one session per process, so the shortcut ID alone identifies ours.
+    tokio::spawn(async move {
+        loop {
+            let (id_matches, event) = tokio::select! {
+                Some(s) = activated.next() => (s.shortcut_id() == ACTION, Event::Start),
+                Some(s) = deactivated.next() => (s.shortcut_id() == ACTION, Event::Stop),
+                else => break,
+            };
+            if id_matches && events.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(Shortcut(Backend::Portal(session)))
 }

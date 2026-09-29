@@ -1,0 +1,13 @@
+Package: fishpr
+Version: @VERSION@
+Architecture: amd64
+Maintainer: Kamaljot Singh <kamaljot.singh@sifars.com>
+Installed-Size: @SIZE@
+Depends: libc6 (>= @GLIBC@), libgcc-s1, libstdc++6, coreutils, pipewire-bin, wl-clipboard, libnotify-bin
+Recommends: xclip
+Suggests: gnome-shell-extension-appindicator
+Section: sound
+Priority: optional
+Homepage: https://github.com/srafis/fishpr
+Description: Push-to-talk dictation for KDE Plasma and GNOME
+ Hold Ctrl+Space, speak, release, and the text is typed where your cursor is.

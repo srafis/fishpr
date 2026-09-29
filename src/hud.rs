@@ -1,6 +1,7 @@
 //! A small "Recording…" pill at the bottom of the screen, drawn as a
-//! wlr-layer-shell overlay (KWin supports it). It never takes focus and lets
-//! clicks through. Runs on its own thread with its own Wayland connection.
+//! wlr-layer-shell overlay (KWin supports it, GNOME doesn't). It never takes
+//! focus and lets clicks through. Runs on its own thread with its own Wayland
+//! connection.
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use smithay_client_toolkit::{
@@ -27,7 +28,13 @@ use smithay_client_toolkit::{
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
-use std::time::Instant;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, Rect, SpreadMode, Transform};
 
 const FONT: &[u8] = include_bytes!("../assets/NotoSans-Medium.ttf");
@@ -59,19 +66,30 @@ enum Msg {
 #[derive(Clone)]
 pub struct Hud {
     tx: Sender<Msg>,
+    running: Arc<AtomicBool>,
 }
 
 impl Hud {
     /// Starts the HUD thread. If Wayland or layer-shell isn't available, the
-    /// HUD is silently disabled; the rest of the app works without it.
+    /// HUD is disabled and `is_running` turns false; the rest of the app works
+    /// without it.
     pub fn spawn() -> Self {
         let (tx, rx) = channel::channel();
-        std::thread::spawn(move || {
-            if let Err(e) = run(rx) {
-                eprintln!("fishpr: HUD disabled: {e:#}");
+        let running = Arc::new(AtomicBool::new(true));
+        std::thread::spawn({
+            let running = running.clone();
+            move || {
+                if let Err(e) = run(rx) {
+                    eprintln!("fishpr: HUD disabled: {e:#}");
+                    running.store(false, Ordering::Relaxed);
+                }
             }
         });
-        Self { tx }
+        Self { tx, running }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
     }
 
     pub fn show(&self) {

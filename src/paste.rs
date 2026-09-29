@@ -1,5 +1,5 @@
-//! Pastes into the focused window by pressing Ctrl+V (KWin doesn't allow
-//! wtype-style fake input, so we go below or around the compositor).
+//! Pastes into the focused window by pressing Ctrl+V (neither KWin nor Mutter
+//! allows wtype-style fake input, so we go below or around the compositor).
 //!
 //! Preferred: a virtual keyboard on /dev/uinput. Silent, but needs write
 //! access to the device (KDE Connect's udev rule grants it to the logged-in
@@ -60,7 +60,7 @@ async fn uinput_paste(keyboard: &mut VirtualDevice) -> Result<()> {
     Ok(())
 }
 
-/// The first call shows KDE's "allow input control" dialog. The portal hands
+/// The first call shows the desktop's "allow input control" dialog. The portal hands
 /// back a single-use restore token that we save, so later calls skip it.
 async fn portal_paste() -> Result<()> {
     let token_path = crate::data_dir()?.join("portal-token");

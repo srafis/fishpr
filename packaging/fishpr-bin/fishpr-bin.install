@@ -6,5 +6,5 @@ post_install() {
 }
 
 post_upgrade() {
-  echo ">>> Restart fishpr to use the new version (tray icon > Quit, then launch fishpr)."
+  echo ">>> Restart fishpr to use the new version: pkill -x fishpr, then launch fishpr from the app menu."
 }

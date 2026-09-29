@@ -1,6 +1,6 @@
 ---
 name: release
-description: Cut a new fishpr release (bump the version, tag, push) and confirm it reaches the pacman repo. Use when the maintainer says "make a release", "release", "ship it", or "cut vX.Y.Z".
+description: Cut a new fishpr release (bump the version, tag, push) and confirm it reaches the pacman and apt repos. Use when the maintainer says "make a release", "release", "ship it", or "cut vX.Y.Z".
 ---
 
 # Releasing fishpr
@@ -11,6 +11,7 @@ Pushing a `v*` tag runs [`release.yml`](../../../.github/workflows/release.yml),
 2. It attaches `fishpr-<ver>-x86_64.tar.gz` to the `v<ver>` GitHub release.
 3. It builds `fishpr-bin` from [`packaging/fishpr-bin/PKGBUILD`](../../../packaging/fishpr-bin/PKGBUILD) and signs it with the `GPG_PRIVATE_KEY` secret.
 4. It publishes the package to the GitHub release tagged `repo`. That release is the `[fishpr]` pacman repo, so users get the new version on their next `pacman -Syu`.
+5. It builds `fishpr_<ver>_amd64.deb` in an Ubuntu 24.04 container with [`packaging/deb/build.sh`](../../../packaging/deb/build.sh), attaches it to the `v<ver>` release, and publishes it to the GitHub release tagged `apt`, the apt repo. Users get it on their next `apt upgrade`.
 
 Run the whole release without checking in at each step. Stop and ask only in these cases:
 
@@ -32,8 +33,8 @@ Run the whole release without checking in at each step. Stop and ask only in the
    - Tag `vX.Y.Z`. The workflow rejects a tag that doesn't match `Cargo.toml`.
    - Run `git push --atomic origin main vX.Y.Z`.
 4. **Verify.**
-   - Watch the run with `gh run watch <id> --exit-status`. It takes about 6 minutes.
-   - Then check that the assets of the `repo` release include `fishpr-bin-X.Y.Z-1-x86_64.pkg.tar.zst` and its `.sig`.
+   - Watch the run with `gh run watch <id> --exit-status`. It takes about 15 minutes: the apt job starts after the pacman one.
+   - Then check that the assets of the `repo` release include `fishpr-bin-X.Y.Z-1-x86_64.pkg.tar.zst` and its `.sig`, and the assets of the `apt` release include `fishpr_X.Y.Z_amd64.deb` and a fresh `InRelease`.
 5. **Report** the version, `https://github.com/srafis/fishpr/releases/tag/vX.Y.Z`, and a line on what changed.
 
 ## If CI fails
@@ -41,6 +42,7 @@ Run the whole release without checking in at each step. Stop and ask only in the
 Read the log with `gh run view <id> --log-failed`.
 
 - **A transient failure** (network, container): run `gh run rerun <id>`. Uploads use `--clobber`, so a rerun is safe.
+- **Only the `deb` job failed:** the pacman repo already has the release. Fix the cause, then run `gh run rerun <id> --failed` if the fix is outside the repo, or release the fix as the next patch.
 - **A code fix is needed and "Sign and publish to the pacman repo" never ran:**
   1. Run `gh release delete vX.Y.Z --yes --cleanup-tag` and `git tag -d vX.Y.Z`.
   2. Fix the code.
@@ -49,7 +51,8 @@ Read the log with `gh run view <id> --log-failed`.
 
 ## Don't touch
 
-- the `repo` release's name and URL, or the package name `fishpr-bin`. Installed systems point at them.
+- the `repo` and `apt` releases' names and URLs, or the package names `fishpr-bin` and `fishpr`. Installed systems point at them.
+- the app ID `io.github.srafis.fishpr` and the desktop file named after it. Desktops key the user's shortcut and portal permissions to it.
 - the signing key. Changing it means every user has to re-run `install.sh`.
-- `repo` release assets. Only CI writes them.
+- `repo` and `apt` release assets. Only CI writes them.
 - `pkgver` and `sha256sums` in the PKGBUILD, which are placeholders CI fills in.

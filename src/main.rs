@@ -1,3 +1,4 @@
+mod control;
 mod desktop;
 mod hud;
 mod paste;
@@ -19,13 +20,22 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use recorder::Recording;
 use transcribe::Transcriber;
 
+/// Matches the installed `<APP_ID>.desktop`. Portals (GNOME's in particular)
+/// only accept an unsandboxed app whose reverse-DNS ID has a .desktop file.
+pub const APP_ID: &str = "io.github.srafis.fishpr";
+
+const USAGE: &str = "usage: fishpr [--toggle]
+
+With no options, starts fishpr. --toggle starts or stops recording in the
+running fishpr; bind it to a key where fishpr can't register its shortcut.";
+
 const ICON_SIZE: u32 = 64;
 /// How often the loading animation advances; frames are picked by elapsed
 /// time, so this only trades smoothness for D-Bus traffic.
 const FRAME_INTERVAL: Duration = Duration::from_millis(66);
 
-/// Everything the main loop reacts to: tray clicks toggle, the shortcut
-/// starts on press and stops on release.
+/// Everything the main loop reacts to: tray clicks and `fishpr --toggle`
+/// toggle, the shortcut starts on press and stops on release.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Event {
     Toggle,
@@ -183,6 +193,8 @@ fn load_animation(gif: &[u8]) -> Animation {
 struct Ui {
     tray: ksni::Handle<FishTray>,
     hud: hud::Hud,
+    /// Stands in for the HUD where it can't run (GNOME has no layer-shell).
+    notice: Option<u32>,
     animation: Option<JoinHandle<()>>,
 }
 
@@ -193,6 +205,14 @@ impl Ui {
         }
         self.tray.update(|t| (t.state, t.frame) = (state, 0)).await;
         if matches!(state, State::Recording) { self.hud.show() } else { self.hud.hide() }
+        if !self.hud.is_running() {
+            match (state, self.notice.take()) {
+                (State::Recording, None) => self.notice = desktop::show_notice("Recording…").await,
+                (State::Recording, notice) => self.notice = notice,
+                (_, Some(id)) => desktop::close_notice(id).await,
+                (_, None) => {}
+            }
+        }
         if matches!(state, State::Loading | State::Transcribing) {
             let tray = self.tray.clone();
             self.animation = Some(tokio::spawn(async move {
@@ -257,15 +277,39 @@ fn drain(events: &mut mpsc::UnboundedReceiver<Event>) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("--toggle") => return control::toggle().await,
+        Some("-h" | "--help") => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Some(arg) => {
+            eprintln!("fishpr: unknown option {arg}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+
+    // Must come before any other portal call. Portals older than 1.19 don't
+    // have it and guess the ID from the systemd unit name instead.
+    if let Err(e) = ashpd::register_host_app(APP_ID.parse().expect("valid app id")).await {
+        eprintln!("fishpr: couldn't register {APP_ID} with the desktop portal: {e}");
+    }
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let _control = control::serve(events_tx.clone()).await?;
+
     let icons = Icons {
         idle: load_icon(include_bytes!("../assets/icon-idle.png")),
         active: load_icon(include_bytes!("../assets/icon-active.png")),
         loading: load_animation(include_bytes!("../assets/icon-loading.gif")),
     };
 
-    let (events_tx, mut events) = mpsc::unbounded_channel();
     let tray = FishTray { state: State::Loading, frame: 0, icons, events: events_tx.clone() };
-    let mut ui = Ui { tray: tray.spawn().await?, hud: hud::Hud::spawn(), animation: None };
+    // Without a tray host (stock GNOME has none), keep running without the
+    // icon; it appears if one shows up later, e.g. the AppIndicator extension.
+    let tray = tray.assume_sni_available(true).spawn().await?;
+    let mut ui = Ui { tray, hud: hud::Hud::spawn(), notice: None, animation: None };
     ui.set(State::Loading).await;
 
     // systemctl stop / Ctrl+C should also release the global shortcut.
@@ -278,11 +322,27 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Said once rather than at every login: where there's no portal (GNOME 47
+    // and older), the user binds `fishpr --toggle` once and is done.
+    let told_marker = data_dir().map(|d| d.join("shortcut-unavailable"));
     let shortcut = match shortcut::Shortcut::register(events_tx.clone()).await {
-        Ok(s) => Some(s),
+        Ok(s) => {
+            if let Ok(marker) = &told_marker {
+                let _ = std::fs::remove_file(marker);
+            }
+            Some(s)
+        }
         Err(e) => {
             eprintln!("fishpr: global shortcut unavailable: {e:#}");
-            desktop::notify("fishpr: Ctrl+Space unavailable", &format!("{e:#}\n\nThe tray icon still works."));
+            if told_marker.as_ref().is_ok_and(|m| !m.exists()) {
+                desktop::notify(
+                    "fishpr: Ctrl+Space unavailable",
+                    &format!("{e:#}\n\nBind the command \"fishpr --toggle\" to a key in your keyboard settings, or use the tray icon."),
+                );
+                if let Ok(marker) = &told_marker {
+                    let _ = std::fs::create_dir_all(marker.parent().unwrap()).and_then(|()| std::fs::write(marker, ""));
+                }
+            }
             None
         }
     };
@@ -335,7 +395,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    ui.hud.hide();
+    ui.set(State::Idle).await;
     if let Some(s) = &shortcut {
         s.unregister().await;
     }
