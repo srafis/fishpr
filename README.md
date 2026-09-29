@@ -27,19 +27,18 @@ Tray icon states:
 
 ## How it works
 
-Audio is streamed to Google's speech service while you're still talking. It's the same service the dictation button on gemini.google.com uses. Because streaming happens during the recording, only the end-of-audio marker is left when you release the key, so the text comes back fast whatever the clip length.
+When you release the key, the recording is checked locally for speech and, if someone spoke, uploaded to ChatGPT's anonymous dictation endpoint (the one behind the microphone button on chatgpt.com when you're logged out). No account or API key is needed.
 
 ```
-pw-record ──PCM──▶ fishpr ──100 ms chunks──▶ Google speech (WebChannel)
-    │                  │                              │
-  mic               on release:                 final text
-                    local VAD ── no speech? ──▶ drop session
-                        │
-                      speech ──▶ end-of-audio ──▶ clipboard + Ctrl+V
+pw-record ──WAV──▶ fishpr ── local VAD ── no speech? ──▶ drop recording
+    │                          │
+  mic                       speech ──▶ chatgpt.com/backend-anon/transcribe
+                                              │
+                                    text ──▶ clipboard + Ctrl+V
 ```
 
 > [!WARNING]
-> **This uses an unofficial, undocumented endpoint.** It uses the Gemini web app's public API key and identifies itself as gemini.google.com. Google can change or block it at any time without notice. Your audio is sent to Google, so don't dictate anything you wouldn't type into Gemini.
+> **This uses an unofficial, undocumented endpoint.** OpenAI can change or block it at any time without notice. Your audio is sent to OpenAI, so don't dictate anything you wouldn't type into ChatGPT.
 
 ## Requirements
 
@@ -67,29 +66,6 @@ The binary is `target/release/fishpr` (about 14 MB, self-contained). Copy it any
 ```sh
 install -Dm755 target/release/fishpr ~/.local/bin/fishpr
 ```
-
-### API key
-
-fishpr needs the Gemini web app's API key. It isn't included in the source. To get it:
-
-1. Open [gemini.google.com](https://gemini.google.com), open DevTools → **Network**, and click the microphone button in the prompt box.
-2. Find a request to `speechs3proto2-pa.googleapis.com/…/streaming/channel` and copy its `x-goog-api-key` request header.
-3. Save it:
-
-```sh
-mkdir -p ~/.config/fishpr
-printf '%s' 'PASTE_KEY_HERE' > ~/.config/fishpr/gemini-api-key
-chmod 600 ~/.config/fishpr/gemini-api-key
-```
-
-Or set `FISHPR_GEMINI_API_KEY` in fishpr's environment.
-
-> [!TIP]
-> If you exported a `.har` file from DevTools, you can pull the key out of it directly:
-> ```sh
-> python3 -c "import json,sys;h=json.load(open(sys.argv[1]));print(next(x['value'] for e in h['log']['entries'] if 'speechs3proto2' in e['request']['url'] for x in e['request']['headers'] if x['name'].lower()=='x-goog-api-key'))" gemini.google.com.har > ~/.config/fishpr/gemini-api-key
-> ```
-> Delete the `.har` afterwards, because it contains your Google session cookies.
 
 ### Start on login
 
@@ -147,8 +123,7 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 
 | Symptom | Likely cause |
 |---|---|
-| "fishpr couldn't start: no Gemini API key" | Set up the [API key](#api-key). |
-| "Transcription failed: … handshake failed: HTTP 403" | The key is wrong or has changed. Grab a fresh one from gemini.google.com. |
+| "Transcription failed: HTTP 4xx/5xx" | The endpoint is rate-limiting or has changed. Try again in a bit. |
 | "fishpr: Ctrl+Space unavailable" | Not running on KDE Plasma, or KWin's shortcut service isn't reachable. The tray icon still works. |
 | "no speech detected" in the log | The voice check heard nobody. Check the mic in System Settings → Audio. |
 | Pastes do nothing | Terminal (see above), or no `/dev/uinput` access and the portal permission was denied. |
@@ -159,8 +134,8 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | File | What it does |
 |---|---|
 | [`src/main.rs`](src/main.rs) | Tray icon, event loop (click / shortcut / quit), state and icon animation |
-| [`src/transcribe.rs`](src/transcribe.rs) | Streaming speech client (WebChannel + protobuf) and the local VAD check. This is the only file that knows about the backend. |
-| [`src/recorder.rs`](src/recorder.rs) | Streams mic PCM from `pw-record` |
+| [`src/transcribe.rs`](src/transcribe.rs) | Client for the dictation endpoint and the local VAD check. This is the only file that knows about the backend. |
+| [`src/recorder.rs`](src/recorder.rs) | Records the mic to a WAV via `pw-record` |
 | [`src/shortcut.rs`](src/shortcut.rs) | <kbd>Ctrl</kbd>+<kbd>Space</kbd> via KGlobalAccel (press *and* release) |
 | [`src/hud.rs`](src/hud.rs) | The "Recording…" overlay (wlr-layer-shell, software-rendered) |
 | [`src/paste.rs`](src/paste.rs) | Ctrl+V via uinput, with the portal fallback |

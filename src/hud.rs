@@ -4,7 +4,7 @@
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState, Region},
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region},
     delegate_registry,
     output::{OutputHandler, OutputState},
     reexports::{
@@ -27,13 +27,22 @@ use smithay_client_toolkit::{
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
+use std::time::Instant;
+use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, Rect, SpreadMode, Transform};
 
 const FONT: &[u8] = include_bytes!("../assets/NotoSans-Medium.ttf");
 const LABEL: &str = "Recording…";
 const HEIGHT: u32 = 44;
 const FONT_SIZE: f32 = 17.0;
 const BOTTOM_MARGIN: i32 = 96;
+/// Transparent border around the pill, leaving room for the drop shadow.
+const SHADOW: f32 = 12.0;
+const PAD: f32 = 20.0;
+const BARS: usize = 5;
+const BAR_W: f32 = 3.0;
+const BAR_GAP: f32 = 3.0;
+const BARS_W: f32 = BARS as f32 * BAR_W + (BARS - 1) as f32 * BAR_GAP;
+const PULSE_PERIOD: f32 = 1.4;
 
 pub struct Hud {
     tx: Sender<bool>,
@@ -87,6 +96,8 @@ fn run(rx: Channel<bool>) -> anyhow::Result<()> {
         pool: None,
         layer: None,
         scale: 1,
+        started: Instant::now(),
+        frame_pending: false,
         font: FontRef::try_from_slice(FONT)?,
     };
     loop {
@@ -105,15 +116,26 @@ struct HudState {
     pool: Option<SlotPool>,
     layer: Option<LayerSurface>,
     scale: i32,
+    started: Instant,
+    frame_pending: bool,
     font: FontRef<'static>,
 }
 
 impl HudState {
-    fn width(&self) -> u32 {
-        // Dot, gap, then the label, with equal padding on both ends.
+    fn label_width(&self) -> f32 {
         let font = self.font.as_scaled(PxScale::from(FONT_SIZE));
-        let text: f32 = LABEL.chars().map(|c| font.h_advance(font.glyph_id(c))).sum();
-        (20.0 + 10.0 + 8.0 + text + 22.0).ceil() as u32
+        LABEL.chars().map(|c| font.h_advance(font.glyph_id(c))).sum()
+    }
+
+    /// Width of the pill itself: dot, label, then the level bars, with equal padding.
+    fn pill_width(&self) -> f32 {
+        (PAD + 14.0 + self.label_width() + 14.0 + BARS_W + PAD).ceil()
+    }
+
+    /// Surface size: the pill plus the shadow border on every side.
+    fn surface_size(&self) -> (u32, u32) {
+        let border = (SHADOW * 2.0) as u32;
+        (self.pill_width() as u32 + border, HEIGHT + border)
     }
 
     fn show(&mut self) {
@@ -127,10 +149,13 @@ impl HudState {
         }
         let layer = self.layer_shell.create_layer_surface(&self.qh, surface, Layer::Overlay, Some("fishpr-hud"), None);
         layer.set_anchor(Anchor::BOTTOM);
-        layer.set_margin(0, 0, BOTTOM_MARGIN, 0);
+        layer.set_margin(0, 0, BOTTOM_MARGIN - SHADOW as i32, 0);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_exclusive_zone(-1);
-        layer.set_size(self.width(), HEIGHT);
+        let (w, h) = self.surface_size();
+        layer.set_size(w, h);
+        self.started = Instant::now();
+        self.frame_pending = false;
         // First commit has no buffer; we draw once the compositor configures us.
         layer.commit();
         self.layer = Some(layer);
@@ -139,32 +164,84 @@ impl HudState {
 
     fn hide(&mut self) {
         self.layer = None; // dropping the layer surface unmaps and destroys it
+        self.frame_pending = false;
         let _ = self.conn.flush();
     }
 
     fn draw(&mut self) {
         let Some(layer) = &self.layer else { return };
-        let (w, h, s) = (self.width(), HEIGHT, self.scale.max(1) as u32);
+        let (w, h) = self.surface_size();
+        let s = self.scale.max(1) as u32;
         let Some(mut pixmap) = Pixmap::new(w * s, h * s) else { return };
         let t = Transform::from_scale(s as f32, s as f32);
+        let time = self.started.elapsed().as_secs_f32();
+        let (pw, ph) = (self.pill_width(), HEIGHT as f32);
+        let cy = ph / 2.0;
+        let pill_t = t.pre_translate(SHADOW, SHADOW);
 
+        // Soft drop shadow: stacked, slightly offset pills of fading opacity.
+        let mut shadow = Paint { anti_alias: true, ..Default::default() };
+        shadow.set_color(Color::from_rgba8(0, 0, 0, 9));
+        for i in 1..=10 {
+            let e = i as f32 * 1.1;
+            if let Some(path) = rounded_rect(pw + 2.0 * e, ph + 2.0 * e, ph / 2.0 + e) {
+                pixmap.fill_path(&path, &shadow, FillRule::Winding, t.pre_translate(SHADOW - e, SHADOW - e + 3.0), None);
+            }
+        }
+
+        // Pill body: a subtle vertical gradient.
         let mut paint = Paint { anti_alias: true, ..Default::default() };
-        paint.set_color(Color::from_rgba8(24, 26, 32, 235));
-        if let Some(pill) = rounded_rect(w as f32, h as f32, h as f32 / 2.0) {
-            pixmap.fill_path(&pill, &paint, FillRule::Winding, t, None);
+        paint.shader = LinearGradient::new(
+            Point::from_xy(0.0, 0.0),
+            Point::from_xy(0.0, ph),
+            vec![
+                GradientStop::new(0.0, Color::from_rgba8(40, 42, 54, 240)),
+                GradientStop::new(1.0, Color::from_rgba8(20, 21, 28, 240)),
+            ],
+            SpreadMode::Pad,
+            Transform::identity(),
+        )
+        .unwrap_or(tiny_skia::Shader::SolidColor(Color::from_rgba8(24, 26, 32, 240)));
+        if let Some(pill) = rounded_rect(pw, ph, ph / 2.0) {
+            pixmap.fill_path(&pill, &paint, FillRule::Winding, pill_t, None);
         }
         // A faint outline keeps the pill visible over dark windows.
-        if let Some(outline) = rounded_rect(w as f32 - 1.0, h as f32 - 1.0, (h as f32 - 1.0) / 2.0) {
+        if let Some(outline) = rounded_rect(pw - 1.0, ph - 1.0, (ph - 1.0) / 2.0) {
             let mut stroke_paint = Paint { anti_alias: true, ..Default::default() };
-            stroke_paint.set_color(Color::from_rgba8(255, 255, 255, 46));
+            stroke_paint.set_color(Color::from_rgba8(255, 255, 255, 40));
             let stroke = tiny_skia::Stroke { width: 1.0, ..Default::default() };
-            pixmap.stroke_path(&outline, &stroke_paint, &stroke, t.pre_translate(0.5, 0.5), None);
+            pixmap.stroke_path(&outline, &stroke_paint, &stroke, pill_t.pre_translate(0.5, 0.5), None);
         }
-        paint.set_color(Color::from_rgba8(230, 36, 48, 255));
-        if let Some(dot) = PathBuilder::from_circle(20.0 + 4.0, h as f32 / 2.0, 6.0) {
-            pixmap.fill_path(&dot, &paint, FillRule::Winding, t, None);
+
+        // Recording dot with an expanding, fading halo.
+        let dot_x = PAD + 7.0;
+        let phase = (time % PULSE_PERIOD) / PULSE_PERIOD;
+        let ease = 1.0 - (1.0 - phase) * (1.0 - phase);
+        paint.shader = tiny_skia::Shader::SolidColor(Color::from_rgba8(255, 69, 82, (110.0 * (1.0 - ease)) as u8));
+        if let Some(halo) = PathBuilder::from_circle(dot_x, cy, 6.0 + 7.0 * ease) {
+            pixmap.fill_path(&halo, &paint, FillRule::Winding, pill_t, None);
         }
-        draw_text(&mut pixmap, &self.font, LABEL, 20.0 + 10.0 + 8.0, h as f32 / 2.0, s as f32);
+        paint.shader = tiny_skia::Shader::SolidColor(Color::from_rgba8(255, 69, 82, 255));
+        if let Some(dot) = PathBuilder::from_circle(dot_x, cy, 5.5) {
+            pixmap.fill_path(&dot, &paint, FillRule::Winding, pill_t, None);
+        }
+
+        let label_x = dot_x + 14.0;
+        draw_text(&mut pixmap, &self.font, LABEL, SHADOW + label_x, SHADOW + cy, s as f32);
+
+        // Animated level bars. There's no audio level plumbed through, so this
+        // is a decorative "listening" indicator.
+        paint.shader = tiny_skia::Shader::SolidColor(Color::from_rgba8(255, 255, 255, 170));
+        let bars_x = label_x + self.label_width() + 14.0;
+        for i in 0..BARS {
+            let f = i as f32;
+            let wave = 0.5 * (time * 5.3 + f * 1.4).sin() + 0.5 * (time * 3.1 + f * 2.3).sin();
+            let bar_h = 5.0 + 11.0 * (0.5 + 0.5 * wave);
+            let x = bars_x + f * (BAR_W + BAR_GAP);
+            if let Some(bar) = rounded_rect(BAR_W, bar_h, BAR_W / 2.0) {
+                pixmap.fill_path(&bar, &paint, FillRule::Winding, pill_t.pre_translate(x, cy - bar_h / 2.0), None);
+            }
+        }
 
         let pool = match &mut self.pool {
             Some(pool) => pool,
@@ -184,6 +261,11 @@ impl HudState {
         let surface = layer.wl_surface();
         surface.set_buffer_scale(s as i32);
         surface.damage_buffer(0, 0, (w * s) as i32, (h * s) as i32);
+        // Ask for a callback so the next frame of the animation gets drawn.
+        if !self.frame_pending {
+            surface.frame(&self.qh, FrameCallbackData(surface.clone()));
+            self.frame_pending = true;
+        }
         if buffer.attach_to(surface).is_ok() {
             layer.commit();
         }
@@ -246,7 +328,10 @@ impl CompositorHandler for HudState {
         }
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+        self.frame_pending = false;
+        self.draw();
+    }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }

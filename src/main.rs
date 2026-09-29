@@ -217,24 +217,16 @@ fn data_dir() -> Result<PathBuf> {
     Ok(base.join("fishpr"))
 }
 
-/// Starts the mic and a streaming session fed by it.
-fn start(transcriber: &Transcriber) -> Result<(Recording, transcribe::Session)> {
-    let (chunks, audio) = mpsc::unbounded_channel();
-    let recording = Recording::start(chunks)?;
-    Ok((recording, transcriber.begin(audio)))
+fn recording_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("fishpr-{}.wav", std::process::id()))
 }
 
-async fn finish(recording: Recording, session: transcribe::Session, transcriber: &Transcriber) -> Result<String> {
-    let pcm = match recording.stop().await {
-        Ok(pcm) => pcm,
-        Err(e) => {
-            let _ = session.finish(false).await;
-            return Err(e);
-        }
-    };
-    // Only ask for a result if someone actually spoke.
-    let speech = transcriber.has_speech(pcm).await.unwrap_or(true);
-    let text = session.finish(speech).await?;
+async fn finish(recording: Recording, transcriber: &Transcriber) -> Result<String> {
+    let path = recording.stop().await?;
+    let result = transcriber.transcribe(&path).await;
+    let _ = tokio::fs::remove_file(&path).await;
+    let text = result?;
     if text.is_empty() {
         anyhow::bail!("no speech detected");
     }
@@ -308,13 +300,14 @@ async fn main() -> Result<()> {
     let mut quit = drain(&mut events);
     ui.set(State::Idle).await;
     let mut paster = paste::Paster::new();
-    let mut recording: Option<(Recording, transcribe::Session)> = None;
+    let path = recording_path();
+    let mut recording: Option<Recording> = None;
 
     while !quit {
         let Some(event) = events.recv().await else { break };
         match (event, recording.take()) {
             (Event::Quit, _) => quit = true,
-            (Event::Toggle | Event::Start, None) => match start(&transcriber) {
+            (Event::Toggle | Event::Start, None) => match Recording::start(&path) {
                 Ok(r) => {
                     recording = Some(r);
                     ui.set(State::Recording).await;
@@ -324,9 +317,9 @@ async fn main() -> Result<()> {
             // Key auto-repeat sends more presses while held; keep recording.
             (Event::Start, Some(r)) => recording = Some(r),
             (Event::Stop, None) => {}
-            (Event::Toggle | Event::Stop, Some((r, session))) => {
+            (Event::Toggle | Event::Stop, Some(r)) => {
                 ui.set(State::Transcribing).await;
-                match finish(r, session, &transcriber).await {
+                match finish(r, &transcriber).await {
                     Ok(text) => deliver(&mut paster, &text).await,
                     Err(e) => {
                         eprintln!("fishpr: {e:#}");
