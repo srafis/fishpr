@@ -1,65 +1,92 @@
-//! The only place that knows about the transcription backend: local Whisper
-//! via whisper.cpp. The model is loaded once and kept in memory.
+//! The only place that knows about the transcription backend: ChatGPT's
+//! anonymous dictation endpoint (unofficial, fast, accurate). Swapping to the
+//! official OpenAI API later means changing this file only.
+//!
+//! A local voice-activity check runs first, so silent or accidental recordings
+//! never leave the machine, and speech-less audio can't come back as invented
+//! text ("you", "Thank you.").
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use reqwest::multipart::{Form, Part};
+use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{WhisperVadContext, WhisperVadContextParams, WhisperVadParams};
 
-const MODEL_FILE: &str = "ggml-base.en.bin";
-/// Segments Whisper itself thinks are probably not speech are dropped; on
-/// silence it otherwise invents words like "you" (measured: speech ≈ 0.01,
-/// hallucinated "you" on silence ≈ 0.94). 0.6 is openai/whisper's default.
-const NO_SPEECH_THRESHOLD: f32 = 0.6;
-const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+const ENDPOINT: &str = "https://chatgpt.com/backend-anon/transcribe";
+
+/// Silero voice activity detection (~1 MB, a few ms per clip).
+const VAD_FILE: &str = "ggml-silero-v5.1.2.bin";
+const VAD_URL: &str = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
+
+#[derive(Deserialize)]
+struct Response {
+    text: String,
+}
 
 pub struct Transcriber {
-    ctx: Arc<WhisperContext>,
+    client: reqwest::Client,
+    vad: Arc<Mutex<WhisperVadContext>>,
 }
 
 impl Transcriber {
-    pub fn load(model: &Path) -> Result<Self> {
+    pub fn load(vad_model: &Path) -> Result<Self> {
         whisper_rs::install_logging_hooks(); // route whisper.cpp's chatter away from stdout
-        let ctx = WhisperContext::new_with_params(model, WhisperContextParameters::default())
-            .with_context(|| format!("loading Whisper model {}", model.display()))?;
-        Ok(Self { ctx: Arc::new(ctx) })
+        let path = vad_model.to_str().context("VAD model path isn't UTF-8")?;
+        let mut params = WhisperVadContextParams::new();
+        params.set_n_threads(1);
+        let vad = WhisperVadContext::new(path, params).context("loading VAD model")?;
+        let client = reqwest::Client::builder()
+            // Cloudflare rejects requests without a User-Agent.
+            .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(120))
+            .build()?;
+        Ok(Self { client, vad: Arc::new(Mutex::new(vad)) })
     }
 
     pub async fn transcribe(&self, wav: &Path) -> Result<String> {
+        if !self.has_speech(wav).await? {
+            return Ok(String::new());
+        }
+
+        let bytes = tokio::fs::read(wav).await.context("reading recording")?;
+        let file = Part::bytes(bytes).file_name("audio.wav").mime_str("audio/wav")?;
+        let form = Form::new()
+            .part("file", file)
+            .text("duration_ms", 1_000_000_000.to_string());
+        let res = self
+            .client
+            .post(ENDPOINT)
+            .header("oai-device-id", uuid::Uuid::new_v4().to_string())
+            .multipart(form)
+            .send()
+            .await
+            .context("sending audio")?;
+
+        let status = res.status();
+        let body = res.text().await.context("reading response")?;
+        let snippet = || body.chars().take(200).collect::<String>();
+        if !status.is_success() {
+            bail!("HTTP {status}: {}", snippet());
+        }
+        let parsed: Response = serde_json::from_str(&body).with_context(|| format!("unexpected response: {}", snippet()))?;
+        Ok(parsed.text.trim().to_string())
+    }
+
+    async fn has_speech(&self, wav: &Path) -> Result<bool> {
         let samples = read_wav(wav)?;
-        let ctx = self.ctx.clone();
+        let vad = self.vad.clone();
         tokio::task::spawn_blocking(move || {
-            let mut state = ctx.create_state()?;
-            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-            params.set_language(Some("en"));
-            params.set_n_threads(std::thread::available_parallelism().map_or(4, |n| n.get()) as i32);
-            params.set_no_context(true);
-            params.set_suppress_blank(true);
-            params.set_suppress_nst(true);
-            params.set_print_special(false);
-            params.set_print_progress(false);
-            params.set_print_realtime(false);
-            params.set_print_timestamps(false);
-            state.full(params, &samples)?;
-            let text: Vec<String> = state
-                .as_iter()
-                .filter(|s| s.no_speech_probability() < NO_SPEECH_THRESHOLD)
-                .map(|s| s.to_string().trim().to_string())
-                .filter(|s| !s.is_empty() && !is_non_speech_tag(s))
-                .collect();
-            Ok(text.join(" "))
+            let segments = vad.lock().unwrap().segments_from_samples(WhisperVadParams::new(), &samples)?;
+            Ok(segments.count() > 0)
         })
         .await?
     }
-}
-
-/// Whisper marks silence and noise with tags like `[BLANK_AUDIO]` or `(wind blowing)`.
-fn is_non_speech_tag(segment: &str) -> bool {
-    (segment.starts_with('[') && segment.ends_with(']')) || (segment.starts_with('(') && segment.ends_with(')'))
 }
 
 /// Reads the 16 kHz mono s16 WAV that `pw-record` writes into f32 samples.
@@ -75,26 +102,22 @@ fn read_wav(path: &Path) -> Result<Vec<f32>> {
     Ok(samples)
 }
 
-/// Path to the model, downloading it on first run. `FISHPR_MODEL` overrides it.
-pub async fn ensure_model() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("FISHPR_MODEL") {
-        return Ok(PathBuf::from(path));
-    }
+/// Path to the VAD model, downloading it on first run.
+pub async fn ensure_vad_model() -> Result<PathBuf> {
     let data_dir = crate::data_dir()?;
-    let model = data_dir.join(MODEL_FILE);
-    if model.exists() {
-        return Ok(model);
+    let path = data_dir.join(VAD_FILE);
+    if path.exists() {
+        return Ok(path);
     }
-
     tokio::fs::create_dir_all(&data_dir).await?;
-    let part = model.with_extension("bin.part");
-    let mut res = reqwest::get(MODEL_URL).await?.error_for_status().context("downloading Whisper model")?;
+    let part = path.with_extension("part");
+    let mut res = reqwest::get(VAD_URL).await?.error_for_status().context("downloading VAD model")?;
     let mut file = tokio::fs::File::create(&part).await?;
     while let Some(chunk) = res.chunk().await? {
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
     // Rename only after a complete download so a crash never leaves a broken model.
-    tokio::fs::rename(&part, &model).await?;
-    Ok(model)
+    tokio::fs::rename(&part, &path).await?;
+    Ok(path)
 }

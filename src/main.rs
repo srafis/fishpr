@@ -93,7 +93,7 @@ impl ksni::Tray for FishTray {
 
     fn tool_tip(&self) -> ksni::ToolTip {
         let description = match self.state {
-            State::Loading => "Loading Whisper model…",
+            State::Loading => "Starting…",
             State::Idle => "Click or hold Ctrl+Space to record",
             State::Recording => "Recording… click or release to transcribe",
             State::Transcribing => "Transcribing…",
@@ -287,10 +287,10 @@ async fn main() -> Result<()> {
         }
     };
 
-    let transcriber = match transcribe::ensure_model().await.and_then(|m| Transcriber::load(&m)) {
+    let transcriber = match transcribe::ensure_vad_model().await.and_then(|m| Transcriber::load(&m)) {
         Ok(t) => t,
         Err(e) => {
-            desktop::notify("fishpr couldn't load Whisper", &format!("{e:#}"));
+            desktop::notify("fishpr couldn't start", &format!("{e:#}"));
             if let Some(s) = &shortcut {
                 s.unregister().await;
             }
