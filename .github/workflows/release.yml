@@ -49,7 +49,7 @@ jobs:
         run: |
           mkdir -p "dist/$TARBALL"
           cp target/release/fishpr packaging/fishpr.desktop packaging/60-fishpr-uinput.rules \
-             assets/NotoSans-OFL.txt "dist/$TARBALL/"
+             LICENSE assets/NotoSans-OFL.txt "dist/$TARBALL/"
           cp assets/icon-idle.png "dist/$TARBALL/fishpr.png"
           tar -C dist -czf "dist/$TARBALL.tar.gz" "$TARBALL"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "fishpr $VERSION" --generate-notes

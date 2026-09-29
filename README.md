@@ -169,3 +169,7 @@ The tag must match `Cargo.toml`, or the workflow stops. Users get the new versio
 
 - Voice activity detection: [Silero VAD](https://github.com/snakers4/silero-vad), run through [whisper.cpp](https://github.com/ggml-org/whisper.cpp) / [whisper-rs](https://codeberg.org/tazz4843/whisper-rs).
 - HUD font: [Noto Sans](https://notofonts.github.io/), SIL Open Font License 1.1 ([`assets/NotoSans-OFL.txt`](assets/NotoSans-OFL.txt)).
+
+## License
+
+[MIT](LICENSE). The bundled Noto Sans font is under the SIL Open Font License 1.1.
