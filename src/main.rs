@@ -1,6 +1,8 @@
 mod desktop;
+mod hud;
 mod paste;
 mod recorder;
+mod shortcut;
 mod transcribe;
 
 use std::{
@@ -21,6 +23,16 @@ const ICON_SIZE: u32 = 64;
 /// How often the loading animation advances; frames are picked by elapsed
 /// time, so this only trades smoothness for D-Bus traffic.
 const FRAME_INTERVAL: Duration = Duration::from_millis(66);
+
+/// Everything the main loop reacts to: tray clicks toggle, the shortcut
+/// starts on press and stops on release.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Event {
+    Toggle,
+    Start,
+    Stop,
+    Quit,
+}
 
 #[derive(Clone, Copy)]
 enum State {
@@ -54,7 +66,7 @@ struct FishTray {
     state: State,
     frame: usize,
     icons: Icons,
-    clicks: mpsc::UnboundedSender<()>,
+    events: mpsc::UnboundedSender<Event>,
 }
 
 impl ksni::Tray for FishTray {
@@ -67,7 +79,7 @@ impl ksni::Tray for FishTray {
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.clicks.send(());
+        let _ = self.events.send(Event::Toggle);
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -82,8 +94,8 @@ impl ksni::Tray for FishTray {
     fn tool_tip(&self) -> ksni::ToolTip {
         let description = match self.state {
             State::Loading => "Loading Whisper model…",
-            State::Idle => "Click to start recording",
-            State::Recording => "Recording… click to stop and transcribe",
+            State::Idle => "Click or hold Ctrl+Space to record",
+            State::Recording => "Recording… click or release to transcribe",
             State::Transcribing => "Transcribing…",
         };
         ksni::ToolTip {
@@ -99,7 +111,9 @@ impl ksni::Tray for FishTray {
             StandardItem {
                 label: "Quit".into(),
                 icon_name: "application-exit".into(),
-                activate: Box::new(|_| std::process::exit(0)),
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.events.send(Event::Quit);
+                }),
                 ..Default::default()
             }
             .into(),
@@ -165,9 +179,10 @@ fn load_animation(gif: &[u8]) -> Animation {
     Animation { frames, ends }
 }
 
-/// Owns the tray handle and runs the loading animation while it's needed.
+/// Owns the tray icon and HUD, keeping both in step with the app state.
 struct Ui {
     tray: ksni::Handle<FishTray>,
+    hud: hud::Hud,
     animation: Option<JoinHandle<()>>,
 }
 
@@ -177,6 +192,7 @@ impl Ui {
             task.abort();
         }
         self.tray.update(|t| (t.state, t.frame) = (state, 0)).await;
+        if matches!(state, State::Recording) { self.hud.show() } else { self.hud.hide() }
         if matches!(state, State::Loading | State::Transcribing) {
             let tray = self.tray.clone();
             self.animation = Some(tokio::spawn(async move {
@@ -229,6 +245,16 @@ async fn deliver(paster: &mut paste::Paster, text: &str) {
     }
 }
 
+/// Drops queued input that arrived while we were busy, so a click or key
+/// press made during transcription doesn't start a new recording. Quit is kept.
+fn drain(events: &mut mpsc::UnboundedReceiver<Event>) -> bool {
+    let mut quit = false;
+    while let Ok(event) = events.try_recv() {
+        quit |= event == Event::Quit;
+    }
+    quit
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let icons = Icons {
@@ -237,35 +263,61 @@ async fn main() -> Result<()> {
         loading: load_animation(include_bytes!("../assets/icon-loading.gif")),
     };
 
-    let (clicks_tx, mut clicks) = mpsc::unbounded_channel();
-    let tray = FishTray { state: State::Loading, frame: 0, icons, clicks: clicks_tx };
-    let mut ui = Ui { tray: tray.spawn().await?, animation: None };
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let tray = FishTray { state: State::Loading, frame: 0, icons, events: events_tx.clone() };
+    let mut ui = Ui { tray: tray.spawn().await?, hud: hud::Hud::spawn(), animation: None };
     ui.set(State::Loading).await;
+
+    // systemctl stop / Ctrl+C should also release the global shortcut.
+    for kind in [tokio::signal::unix::SignalKind::terminate(), tokio::signal::unix::SignalKind::interrupt()] {
+        let mut signal = tokio::signal::unix::signal(kind)?;
+        let tx = events_tx.clone();
+        tokio::spawn(async move {
+            signal.recv().await;
+            let _ = tx.send(Event::Quit);
+        });
+    }
+
+    let shortcut = match shortcut::Shortcut::register(events_tx.clone()).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("fishpr: global shortcut unavailable: {e:#}");
+            desktop::notify("fishpr: Ctrl+Space unavailable", &format!("{e:#}\n\nThe tray icon still works."));
+            None
+        }
+    };
 
     let transcriber = match transcribe::ensure_model().await.and_then(|m| Transcriber::load(&m)) {
         Ok(t) => t,
         Err(e) => {
             desktop::notify("fishpr couldn't load Whisper", &format!("{e:#}"));
+            if let Some(s) = &shortcut {
+                s.unregister().await;
+            }
             return Err(e);
         }
     };
-    // Clicks made while the model was loading shouldn't start a recording.
-    while clicks.try_recv().is_ok() {}
+    let mut quit = drain(&mut events);
     ui.set(State::Idle).await;
     let mut paster = paste::Paster::new();
     let path = recording_path();
     let mut recording: Option<Recording> = None;
 
-    while clicks.recv().await.is_some() {
-        match recording.take() {
-            None => match Recording::start(&path) {
+    while !quit {
+        let Some(event) = events.recv().await else { break };
+        match (event, recording.take()) {
+            (Event::Quit, _) => quit = true,
+            (Event::Toggle | Event::Start, None) => match Recording::start(&path) {
                 Ok(r) => {
                     recording = Some(r);
                     ui.set(State::Recording).await;
                 }
                 Err(e) => desktop::notify("Couldn't start recording", &format!("{e:#}")),
             },
-            Some(r) => {
+            // Key auto-repeat sends more presses while held; keep recording.
+            (Event::Start, Some(r)) => recording = Some(r),
+            (Event::Stop, None) => {}
+            (Event::Toggle | Event::Stop, Some(r)) => {
                 ui.set(State::Transcribing).await;
                 match finish(r, &transcriber).await {
                     Ok(text) => deliver(&mut paster, &text).await,
@@ -274,11 +326,15 @@ async fn main() -> Result<()> {
                         desktop::notify("Transcription failed", &format!("{e:#}"));
                     }
                 }
-                // Clicks made while transcribing shouldn't start a new recording.
-                while clicks.try_recv().is_ok() {}
+                quit = drain(&mut events);
                 ui.set(State::Idle).await;
             }
         }
+    }
+
+    ui.hud.hide();
+    if let Some(s) = &shortcut {
+        s.unregister().await;
     }
     Ok(())
 }

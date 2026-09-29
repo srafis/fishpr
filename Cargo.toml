@@ -4,16 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ab_glyph = "0.2.32"
 anyhow = "1.0.104"
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
 evdev = "0.13.2"
+futures-util = "0.3.34"
 hound = "3.5.1"
 image = { version = "0.25.10", default-features = false, features = ["gif", "png"] }
 ksni = "0.3.6"
 libc = "0.2.189"
 reqwest = { version = "0.13.5", features = ["multipart", "json"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "fs"] }
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["calloop"] }
+tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "fs", "signal"] }
 whisper-rs = "0.16.0"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [profile.release]
 strip = true

@@ -11,6 +11,10 @@ use tokio::io::AsyncWriteExt;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 const MODEL_FILE: &str = "ggml-base.en.bin";
+/// Segments Whisper itself thinks are probably not speech are dropped; on
+/// silence it otherwise invents words like "you" (measured: speech ≈ 0.01,
+/// hallucinated "you" on silence ≈ 0.94). 0.6 is openai/whisper's default.
+const NO_SPEECH_THRESHOLD: f32 = 0.6;
 const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
 
 pub struct Transcriber {
@@ -43,6 +47,7 @@ impl Transcriber {
             state.full(params, &samples)?;
             let text: Vec<String> = state
                 .as_iter()
+                .filter(|s| s.no_speech_probability() < NO_SPEECH_THRESHOLD)
                 .map(|s| s.to_string().trim().to_string())
                 .filter(|s| !s.is_empty() && !is_non_speech_tag(s))
                 .collect();
