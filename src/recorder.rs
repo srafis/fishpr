@@ -1,51 +1,70 @@
-//! Mic recording by driving `pw-record` (PipeWire) as a child process.
+//! Mic recording by driving `pw-record` (PipeWire) as a child process. Raw
+//! 16 kHz mono s16le PCM is streamed out in ~100 ms chunks as it's captured,
+//! and also kept whole for the speech check on release.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-};
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
-use tokio::process::{Child, Command};
+use tokio::{
+    io::AsyncReadExt,
+    process::{Child, Command},
+    sync::mpsc::UnboundedSender,
+    task::JoinHandle,
+};
 
-/// A 16-bit header-only WAV is 44 bytes; anything this small has no audio.
-const MIN_WAV_BYTES: u64 = 1024;
+/// 100 ms of 16 kHz mono s16le.
+const CHUNK_BYTES: usize = 3200;
 
 pub struct Recording {
     child: Child,
-    path: PathBuf,
+    reader: JoinHandle<Vec<u8>>,
 }
 
 impl Recording {
-    pub fn start(path: &Path) -> Result<Self> {
-        let _ = std::fs::remove_file(path);
-        let child = Command::new("pw-record")
-            .args(["--rate", "16000", "--channels", "1", "--format", "s16"])
-            .arg(path)
+    pub fn start(chunks: UnboundedSender<Vec<u8>>) -> Result<Self> {
+        let mut child = Command::new("pw-record")
+            .args(["--rate", "16000", "--channels", "1", "--format", "s16", "--raw", "-"])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("starting pw-record (is pipewire installed?)")?;
-        Ok(Self { child, path: path.to_path_buf() })
+        let mut stdout = child.stdout.take().expect("stdout is piped");
+        let reader = tokio::spawn(async move {
+            let mut all = Vec::new();
+            let mut buf = vec![0; CHUNK_BYTES];
+            while let Ok(n) = stdout.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                // The session may have failed already; keep recording anyway.
+                let _ = chunks.send(buf[..n].to_vec());
+                all.extend_from_slice(&buf[..n]);
+            }
+            all // dropping `chunks` here tells the session the audio is complete
+        });
+        Ok(Self { child, reader })
     }
 
-    /// Stops recording and returns the path of the finished WAV file.
-    pub async fn stop(self) -> Result<PathBuf> {
+    /// Stops recording and returns everything that was captured.
+    pub async fn stop(mut self) -> Result<Vec<u8>> {
         if let Some(pid) = self.child.id() {
-            // SIGINT lets pw-record finalize the WAV header; SIGKILL would not.
+            // SIGINT lets pw-record flush and exit cleanly.
             unsafe { libc::kill(pid as i32, libc::SIGINT) };
         }
-        let out = self.child.wait_with_output().await?;
-        let size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        if size < MIN_WAV_BYTES {
-            let err = String::from_utf8_lossy(&out.stderr);
-            if !out.status.success() && !err.trim().is_empty() {
+        let status = self.child.wait().await?;
+        let pcm = self.reader.await?;
+        if pcm.is_empty() {
+            let mut err = String::new();
+            if let Some(mut stderr) = self.child.stderr.take() {
+                let _ = stderr.read_to_string(&mut err).await;
+            }
+            if !status.success() && !err.trim().is_empty() {
                 bail!("pw-record failed: {}", err.trim());
             }
             bail!("recording was empty");
         }
-        Ok(self.path)
+        Ok(pcm)
     }
 }
