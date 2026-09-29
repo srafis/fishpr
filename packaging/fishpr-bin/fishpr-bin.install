@@ -1,0 +1,10 @@
+post_install() {
+  # Apply the uinput rule now, so silent pasting works without logging out.
+  udevadm control --reload 2>/dev/null
+  udevadm trigger --action=change --name-match=uinput 2>/dev/null
+  echo ">>> fishpr starts automatically on login. To start it now, run: fishpr &"
+}
+
+post_upgrade() {
+  echo ">>> Restart fishpr to use the new version (tray icon > Quit, then launch fishpr)."
+}

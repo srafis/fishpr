@@ -43,50 +43,48 @@ pw-record ──WAV──▶ fishpr ── local VAD ── no speech? ──▶
 ## Requirements
 
 - **KDE Plasma 6 on Wayland.** fishpr uses KDE's global-shortcut service and KWin's overlay (layer-shell) protocol. Clicking the tray icon also works on other desktops with a StatusNotifier tray.
-- **PipeWire** for `pw-record`. This is the default on Arch.
-- **wl-clipboard** for `wl-copy`, or `xclip` on X11.
-- **libnotify** for `notify-send`.
-- **Access to `/dev/uinput`** for silent pasting. If you have KDE Connect installed you already have it. Otherwise see [Pasting](#pasting).
-
-To build: a Rust toolchain, plus **cmake** and **clang**. These compile whisper.cpp, which provides the voice check.
-
-```sh
-sudo pacman -S --needed rust cmake clang pipewire wl-clipboard libnotify
-```
+- **Arch Linux on x86_64** for the one-line installer. On anything else, [build from source](#build-from-source).
 
 ## Install
 
 ```sh
-git clone <this repo> fishpr && cd fishpr
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/srafis/fishpr/main/install.sh | sh
 ```
 
-The binary is `target/release/fishpr` (about 14 MB, self-contained). Copy it anywhere, for example:
+This adds fishpr's signed pacman repo to `/etc/pacman.conf`, then installs the `fishpr-bin` package. The package brings in the dependencies (PipeWire, wl-clipboard, libnotify), installs the [uinput rule](#pasting) for silent pasting, and makes fishpr start on login. The installer then starts fishpr. It uses `pacman -Syu`, so it also upgrades the rest of your system.
+
+If you installed fishpr by hand before, delete `~/.local/bin/fishpr` and `~/.config/autostart/fishpr.desktop`. The old autostart entry would otherwise override the packaged one.
+
+### Updating
+
+New versions arrive with your normal system upgrade (`sudo pacman -Syu` or `yay`). The running copy keeps its old version until you restart it: tray icon → **Quit**, then launch fishpr from the app menu. Or run the install command again, which updates and restarts it in one go.
+
+### Uninstall
 
 ```sh
+sudo pacman -R fishpr-bin
+```
+
+Then delete the `[fishpr]` section at the end of `/etc/pacman.conf`. The downloaded model and settings are in `~/.local/share/fishpr/`.
+
+### Build from source
+
+You need a Rust toolchain, plus **cmake** and **clang** to compile whisper.cpp, which provides the voice check.
+
+```sh
+sudo pacman -S --needed rust cmake clang pipewire-audio wl-clipboard libnotify
+git clone https://github.com/srafis/fishpr && cd fishpr
+cargo build --release
 install -Dm755 target/release/fishpr ~/.local/bin/fishpr
 ```
 
-### Start on login
-
-```sh
-mkdir -p ~/.config/autostart
-cat > ~/.config/autostart/fishpr.desktop <<EOF
-[Desktop Entry]
-Type=Application
-Name=fishpr
-Comment=Push-to-talk dictation
-Exec=$HOME/.local/bin/fishpr
-Icon=audio-input-microphone
-X-KDE-autostart-phase=2
-EOF
-```
-
-Or run it right away without logging out:
+The binary is self-contained, about 14 MB. To start it on login, copy [`packaging/fishpr.desktop`](packaging/fishpr.desktop) to `~/.config/autostart/` and change `Exec=` to the binary's full path. To start it now, without logging out:
 
 ```sh
 systemd-run --user --unit=app-fishpr --collect ~/.local/bin/fishpr
 ```
+
+For silent pasting, also install the [uinput rule](#pasting).
 
 On first launch fishpr downloads the voice-activity model (Silero VAD, ~1 MB) to `~/.local/share/fishpr/`.
 
@@ -104,11 +102,10 @@ On first launch fishpr downloads the voice-activity model (Silero VAD, ~1 MB) to
 
 fishpr pastes by pressing <kbd>Ctrl</kbd>+<kbd>V</kbd> on a virtual keyboard it creates through `/dev/uinput`. KWin doesn't let apps fake key presses any other way. This is silent and needs no permission prompt, as long as your user can write to `/dev/uinput`.
 
-KDE Connect ships a udev rule that grants this. Without KDE Connect, add the same rule yourself:
+The `fishpr-bin` package installs a udev rule that grants this. KDE Connect ships the same rule. If you built from source and don't have KDE Connect, add the rule yourself:
 
 ```sh
-echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' \
-  | sudo tee /etc/udev/rules.d/60-fishpr-uinput.rules
+sudo install -Dm644 packaging/60-fishpr-uinput.rules -t /etc/udev/rules.d/
 ```
 
 Then log out and back in (or reboot).
@@ -119,7 +116,7 @@ Without uinput access, fishpr falls back to the desktop's RemoteDesktop portal. 
 
 ## Troubleshooting
 
-To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When started with `systemd-run`, use `journalctl --user -u app-fishpr -f`.
+To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When started on login or with `systemd-run`, use `journalctl --user -u 'app-fishpr*' -f`.
 
 | Symptom | Likely cause |
 |---|---|
@@ -141,9 +138,32 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | [`src/paste.rs`](src/paste.rs) | Ctrl+V via uinput, with the portal fallback |
 | [`src/desktop.rs`](src/desktop.rs) | Clipboard and notifications |
 
+| [`install.sh`](install.sh) | The one-line installer: adds the pacman repo, installs, starts |
+| [`packaging/`](packaging/) | `fishpr-bin` PKGBUILD, desktop entry, uinput udev rule |
+| [`.github/workflows/release.yml`](.github/workflows/release.yml) | Builds, signs, and publishes a release when a `v*` tag is pushed |
+
 To switch transcription backends (for example to the official OpenAI API), replace `Transcriber::begin` / `Session::finish` in `transcribe.rs`. Nothing else needs to change.
 
 Run the tests with `cargo test`.
+
+## Releasing
+
+Releases are built by CI. The pacman repo lives in the assets of the GitHub release tagged `repo`: the package, its database, and the public signing key that `install.sh` imports.
+
+**One-time setup:** create a signing key without a passphrase and store it as a repo secret. Keep a backup of the key somewhere safe.
+
+```sh
+gpg --batch --passphrase '' --quick-gen-key "fishpr package signing" ed25519 sign never
+gpg --armor --export-secret-keys "fishpr package signing" | gh secret set GPG_PRIVATE_KEY
+```
+
+**Each release:** bump `version` in `Cargo.toml`, commit, then tag and push:
+
+```sh
+git tag v0.2.0 && git push origin main v0.2.0
+```
+
+The tag must match `Cargo.toml`, or the workflow stops. Users get the new version on their next `pacman -Syu`.
 
 ## Credits
 

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=fishpr
+GenericName=Push-to-talk dictation
+Comment=Hold Ctrl+Space, speak, release, and the text is typed where your cursor is
+Exec=fishpr
+Icon=fishpr
+Terminal=false
+Categories=Utility;Accessibility;
+X-KDE-autostart-phase=2

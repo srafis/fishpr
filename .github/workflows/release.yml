@@ -1,0 +1,102 @@
+# Push a tag like v0.2.0 (matching Cargo.toml) to:
+#   1. build the binary and attach fishpr-<ver>-x86_64.tar.gz to the v0.2.0 release
+#   2. build fishpr-bin from packaging/fishpr-bin/PKGBUILD and sign it
+#   3. publish it to the pacman repo stored in the `repo` release
+#
+# Needs the GPG_PRIVATE_KEY secret: an armored, passphrase-less signing key.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed rust cmake clang git github-cli
+
+      - uses: actions/checkout@v5
+
+      - name: Check version
+        run: |
+          version=${TAG#v}
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::tag $TAG doesn't match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "TARBALL=fishpr-$version-x86_64" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Upload tarball
+        run: |
+          mkdir -p "dist/$TARBALL"
+          cp target/release/fishpr packaging/fishpr.desktop packaging/60-fishpr-uinput.rules \
+             assets/NotoSans-OFL.txt "dist/$TARBALL/"
+          cp assets/icon-idle.png "dist/$TARBALL/fishpr.png"
+          tar -C dist -czf "dist/$TARBALL.tar.gz" "$TARBALL"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "fishpr $VERSION" --generate-notes
+          gh release upload "$TAG" "dist/$TARBALL.tar.gz" --clobber
+
+      - name: Build package
+        run: |
+          mkdir pkg
+          cp packaging/fishpr-bin/* "dist/$TARBALL.tar.gz" pkg/
+          sum=$(sha256sum "pkg/$TARBALL.tar.gz" | cut -d' ' -f1)
+          sed -i -e "s/^pkgver=.*/pkgver=$VERSION/" -e "s/^sha256sums=.*/sha256sums=('$sum')/" pkg/PKGBUILD
+          # makepkg refuses to run as root. --nodeps: runtime deps aren't needed to package a binary.
+          useradd -m builder
+          chown -R builder pkg
+          su builder -c 'cd pkg && makepkg --nodeps'
+
+      - name: Sign and publish to the pacman repo
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::error::the GPG_PRIVATE_KEY secret isn't set"
+            exit 1
+          fi
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          fpr=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ { print $10; exit }')
+
+          cd pkg
+          package=$(ls "fishpr-bin-$VERSION"-*.pkg.tar.zst)
+          gpg --batch --local-user "$fpr" --detach-sign "$package"
+          repo-add --sign --key "$fpr" fishpr.db.tar.gz "$package"
+
+          # Release assets can't be symlinks, so copy repo-add's fishpr.db -> fishpr.db.tar.gz links.
+          mkdir ../repo
+          cp -L "$package" "$package.sig" fishpr.db fishpr.db.sig fishpr.files fishpr.files.sig ../repo/
+          gpg --armor --export "$fpr" > ../repo/fishpr.gpg
+
+          gh release view repo >/dev/null 2>&1 || gh release create repo --latest=false \
+            --title "pacman repo" --notes "Storage for the [fishpr] pacman repo. Install with install.sh in the repo root."
+          # Package first, then the database that points at it, so clients never see a missing file.
+          gh release upload repo "../repo/$package" "../repo/$package.sig" --clobber
+          gh release upload repo ../repo/fishpr.db ../repo/fishpr.db.sig ../repo/fishpr.files ../repo/fishpr.files.sig \
+            ../repo/fishpr.gpg --clobber
+
+          gh release view repo --json assets --jq '.assets[].name' | while read -r asset; do
+            case "$asset" in
+              "$package" | "$package.sig") ;;
+              fishpr-bin-*.pkg.tar.zst*) gh release delete-asset repo "$asset" --yes ;;
+            esac
+          done

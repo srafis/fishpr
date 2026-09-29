@@ -1,0 +1,29 @@
+# Maintainer: Kamaljot Singh
+#
+# pkgver and sha256sums are filled in by .github/workflows/release.yml.
+
+pkgname=fishpr-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Push-to-talk dictation for KDE Plasma'
+arch=('x86_64')
+url='https://github.com/srafis/fishpr'
+license=('unknown')
+depends=('glibc' 'libgcc' 'libstdc++' 'pipewire-audio' 'wl-clipboard' 'libnotify')
+optdepends=('xclip: clipboard on X11')
+provides=('fishpr')
+conflicts=('fishpr')
+options=('!debug')  # the release profile already strips the binary
+install=fishpr-bin.install
+source=("$url/releases/download/v$pkgver/fishpr-$pkgver-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "fishpr-$pkgver-x86_64"
+  install -Dm755 fishpr -t "$pkgdir/usr/bin"
+  install -Dm644 fishpr.desktop -t "$pkgdir/usr/share/applications"
+  install -Dm644 fishpr.desktop -t "$pkgdir/etc/xdg/autostart"
+  install -Dm644 60-fishpr-uinput.rules -t "$pkgdir/usr/lib/udev/rules.d"
+  install -Dm644 fishpr.png -t "$pkgdir/usr/share/pixmaps"
+  install -Dm644 NotoSans-OFL.txt -t "$pkgdir/usr/share/licenses/$pkgname"
+}
