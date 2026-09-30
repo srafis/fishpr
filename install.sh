@@ -111,12 +111,20 @@ setup_gnome_tray() {
     gsettings_add org.gnome.shell enabled-extensions "$extension"
 }
 
+# Whether this session runs GNOME. The calling shell's XDG_CURRENT_DESKTOP can
+# be missing (IDE terminals, tmux, ssh), so also ask the user's systemd, which
+# GNOME tells, and look for gnome-shell itself.
+is_gnome() {
+    desktop=${XDG_CURRENT_DESKTOP:-$(systemctl --user show-environment 2>/dev/null | sed -n 's/^XDG_CURRENT_DESKTOP=//p')}
+    case ":$desktop:" in *:GNOME:*) return 0 ;; esac
+    pgrep -u "$(id -u)" -x gnome-shell >/dev/null
+}
+
 # GNOME 48 and later let fishpr register a hold-to-talk shortcut itself (GNOME
 # asks the user on first start). Older GNOME can't, so offer a toggle key.
 setup_gnome_shortcut() {
-    version=$(gnome-shell --version 2>/dev/null | awk '{ print int($3) }')
-    [ "${version:-0}" -ge 48 ] && return 0
-    ask "GNOME ${version:-this old} can't give fishpr a hold-to-talk shortcut. Make Ctrl+Space start and stop dictation instead?" || return 0
+    [ "$gnome_version" -ge 48 ] && return 0
+    ask "GNOME $gnome_version can't give fishpr a hold-to-talk shortcut. Make Ctrl+Space start and stop dictation instead?" || return 0
 
     schema=org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$TOGGLE_KEYBINDING
     gsettings set "$schema" name 'fishpr: start or stop dictation'
@@ -145,8 +153,10 @@ main() {
     "install_$pm"
 
     gnome=
-    case ":${XDG_CURRENT_DESKTOP:-}:" in *:GNOME:*) gnome=1 ;; esac
-    if [ -n "$gnome" ] && command -v gsettings >/dev/null; then
+    gnome_version=0
+    if is_gnome && command -v gsettings >/dev/null; then
+        gnome=1
+        gnome_version=$(gnome-shell --version 2>/dev/null | awk '{ print int($3) }')
         setup_gnome_tray
         setup_gnome_shortcut
     fi
@@ -163,6 +173,9 @@ main() {
     if systemd-run --user --unit="app-$APP_ID" --collect /usr/bin/fishpr >/dev/null 2>&1; then
         if [ -n "$toggle_key" ]; then
             echo "==> fishpr is running. Press Ctrl+Space to start dictating, and again to stop."
+        elif [ -n "$gnome" ] && [ "$gnome_version" -lt 48 ]; then
+            echo "==> fishpr is running. To dictate, click its tray icon, or bind the command 'fishpr --toggle'"
+            echo "    to a key in Settings > Keyboard > Custom Shortcuts."
         elif [ -n "$gnome" ]; then
             echo "==> fishpr is running. Allow its shortcut when GNOME asks, then hold Ctrl+Space to dictate."
         else
