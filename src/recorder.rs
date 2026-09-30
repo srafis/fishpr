@@ -5,6 +5,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    sync::OnceLock,
 };
 
 use anyhow::{Context, Result, bail};
@@ -37,7 +38,9 @@ impl Recording {
         // stdbuf -o0: pw-record's stdout is otherwise block-buffered, which
         // delivers audio in 128 ms bursts and makes the meter stutter.
         let mut child = Command::new("stdbuf")
-            .args(["-o0", "pw-record", "--raw", "--rate", "16000", "--channels", "1", "--format", "s16", "-"])
+            .args(["-o0", "pw-record"])
+            .args(raw_flag())
+            .args(["--rate", "16000", "--channels", "1", "--format", "s16", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -80,6 +83,19 @@ impl Recording {
         write_wav(&self.path, &pcm)?;
         Ok(self.path)
     }
+}
+
+/// Recent pw-record needs `--raw` to write bare PCM to stdout. Older ones
+/// (PipeWire 1.0, in Ubuntu 24.04) already do that for `-` and reject the flag.
+fn raw_flag() -> Option<&'static str> {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    let supported = *SUPPORTED.get_or_init(|| {
+        std::process::Command::new("pw-record")
+            .arg("--help")
+            .output()
+            .is_ok_and(|out| [out.stdout, out.stderr].iter().any(|text| String::from_utf8_lossy(text).contains("--raw")))
+    });
+    supported.then_some("--raw")
 }
 
 fn samples(pcm: &[u8]) -> impl Iterator<Item = i16> + '_ {
