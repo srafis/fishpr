@@ -5,13 +5,12 @@
 pkgname=fishpr-bin
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Push-to-talk dictation for KDE Plasma and GNOME'
+pkgdesc='Push-to-talk dictation for KDE Plasma'
 arch=('x86_64')
 url='https://github.com/srafis/fishpr'
 license=('MIT' 'OFL-1.1')  # OFL covers the bundled Noto Sans font
 depends=('glibc' 'libgcc' 'libstdc++' 'pipewire-audio' 'wl-clipboard' 'libnotify')
-optdepends=('xclip: clipboard on X11'
-            'gnome-shell-extension-appindicator: tray icon on GNOME')
+optdepends=('xclip: clipboard on X11')
 provides=('fishpr')
 conflicts=('fishpr')
 options=('!debug')  # the release profile already strips the binary

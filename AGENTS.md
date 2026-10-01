@@ -1,6 +1,6 @@
 # AGENTS.md
 
-fishpr is push-to-talk dictation for KDE Plasma 6 and GNOME on Wayland, written in Rust. [README.md](README.md) explains what it does and lists what each file in `src/` does.
+fishpr is push-to-talk dictation for KDE Plasma 6 on Wayland, written in Rust. [README.md](README.md) explains what it does and lists what each file in `src/` does.
 
 ## Build and test
 

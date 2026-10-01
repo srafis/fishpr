@@ -5,7 +5,7 @@
 <h1 align="center">fishpr</h1>
 
 <p align="center">
-  Push-to-talk dictation for KDE Plasma and GNOME on Linux.<br>
+  Push-to-talk dictation for KDE Plasma on Linux.<br>
   Hold <kbd>Ctrl</kbd>+<kbd>Space</kbd>, speak, release, and the text is typed where your cursor is.
 </p>
 
@@ -13,7 +13,7 @@
 
 ## What it does
 
-- **Hold to talk.** Hold <kbd>Ctrl</kbd>+<kbd>Space</kbd> anywhere. A small "Recording…" pill appears at the bottom of the screen (a "Recording…" notification on GNOME). Let go and the transcription lands in the focused window about half a second later.
+- **Hold to talk.** Hold <kbd>Ctrl</kbd>+<kbd>Space</kbd> anywhere. A small "Recording…" pill appears at the bottom of the screen. Let go and the transcription lands in the focused window about half a second later.
 - **Or click the tray icon.** Click once to start, click again to stop. Tray and shortcut share one state, so you can start with one and stop with the other.
 - **Pastes for you.** The text goes on the clipboard and is pasted into the focused app with <kbd>Ctrl</kbd>+<kbd>V</kbd>. If pasting fails, it's still on your clipboard.
 - **Quiet when it works.** A notification appears only when something goes wrong.
@@ -42,15 +42,7 @@ pw-record ──WAV──▶ fishpr ── local VAD ── no speech? ──▶
 
 ## Requirements
 
-- **KDE Plasma 6 or GNOME, on Wayland.**
-
-  | | KDE Plasma 6 | GNOME 48 and later | GNOME 46–47 (Ubuntu 24.04) |
-  |---|---|---|---|
-  | Hold <kbd>Ctrl</kbd>+<kbd>Space</kbd> to talk | Yes | Yes, after you allow it once | Press to start, press again to stop |
-  | "Recording…" indicator | Pill overlay | Notification | Notification |
-  | Tray icon | Yes | With the AppIndicator extension (Ubuntu has it on) | With the AppIndicator extension (Ubuntu has it on) |
-
-  Other desktops get the tray icon, if they have a StatusNotifier tray, and `fishpr --toggle` to bind to a key.
+- **KDE Plasma 6, on Wayland.** GNOME isn't supported.
 - **Arch Linux, Ubuntu 24.04 or later, or Debian 13 or later, on x86_64** for the one-line installer. On anything else, [build from source](#build-from-source).
 
 ## Install
@@ -64,14 +56,7 @@ The installer adds fishpr's signed package repo and installs fishpr from it:
 - **Arch:** adds the `[fishpr]` repo to `/etc/pacman.conf` and installs `fishpr-bin`. It uses `pacman -Syu`, so it also upgrades the rest of your system.
 - **Ubuntu and Debian:** adds `/etc/apt/sources.list.d/fishpr.sources`, with the signing key in `/etc/apt/keyrings/fishpr.asc` (trusted for fishpr's repo only), and installs `fishpr`.
 
-The package brings in the dependencies (PipeWire, wl-clipboard, libnotify), installs the [uinput rule](#pasting) for silent pasting, and makes fishpr start on login.
-
-On GNOME, the installer asks before it changes anything:
-
-- If no AppIndicator extension is on, it offers to install and turn one on, so you get the tray icon. A newly installed extension shows up after you log out and back in.
-- On GNOME 47 and older, it offers to bind <kbd>Ctrl</kbd>+<kbd>Space</kbd> to start and stop dictation, since those versions can't do hold-to-talk. The binding appears in **Settings → Keyboard → Custom Shortcuts**.
-
-The installer then starts fishpr. On GNOME 48 and later, GNOME asks once whether to allow fishpr's shortcut.
+The package brings in the dependencies (PipeWire, wl-clipboard, libnotify), installs the [uinput rule](#pasting) for silent pasting, and makes fishpr start on login. The installer then starts fishpr.
 
 If you installed fishpr by hand before, delete `~/.local/bin/fishpr` and `~/.config/autostart/fishpr.desktop`. The old autostart entry would otherwise override the packaged one.
 
@@ -96,7 +81,7 @@ sudo apt purge fishpr
 sudo rm /etc/apt/sources.list.d/fishpr.sources /etc/apt/keyrings/fishpr.asc
 ```
 
-The downloaded model and settings are in `~/.local/share/fishpr/`. If the installer set up the GNOME toggle shortcut, remove it in **Settings → Keyboard → Custom Shortcuts**.
+The downloaded model and settings are in `~/.local/share/fishpr/`.
 
 ### Build from source
 
@@ -122,7 +107,7 @@ sed "s|^Exec=.*|Exec=$HOME/.local/bin/fishpr|" packaging/io.github.srafis.fishpr
 install -Dm644 io.github.srafis.fishpr.desktop -t ~/.local/share/applications
 ```
 
-The binary is self-contained, about 14 MB. The desktop entry is needed on GNOME, where the shortcut portal only accepts apps it can find in the app menu. To start fishpr on login, also copy that `io.github.srafis.fishpr.desktop` to `~/.config/autostart/`. To start it now, without logging out:
+The binary is self-contained, about 14 MB. The desktop entry puts fishpr in the app menu, and the desktop portal needs it to recognize fishpr. To start fishpr on login, also copy that `io.github.srafis.fishpr.desktop` to `~/.config/autostart/`. To start it now, without logging out:
 
 ```sh
 systemd-run --user --unit=app-io.github.srafis.fishpr --collect ~/.local/bin/fishpr
@@ -141,13 +126,13 @@ On first launch fishpr downloads the voice-activity model (Silero VAD, ~1 MB) to
 | Run `fishpr --toggle` | Starts recording, or stops and pastes, like a tray click |
 | Right-click the tray icon → **Quit**, or run `pkill -x fishpr` | fishpr exits and releases <kbd>Ctrl</kbd>+<kbd>Space</kbd> |
 
-**Changing the shortcut:** <kbd>Ctrl</kbd>+<kbd>Space</kbd> is only the default, and your choice is kept across restarts. On KDE, rebind it in **System Settings → Keyboard → Shortcuts → fishpr → Push to talk (hold)**. On GNOME 48 and later, use **Settings → Apps → fishpr**. While fishpr is running, the desktop captures the combo, so apps no longer see it. In most IDEs <kbd>Ctrl</kbd>+<kbd>Space</kbd> is "trigger suggestions", so rebind it if you miss that.
+**Changing the shortcut:** <kbd>Ctrl</kbd>+<kbd>Space</kbd> is only the default, and your choice is kept across restarts. Rebind it in **System Settings → Keyboard → Shortcuts → fishpr → Push to talk (hold)**. While fishpr is running, the desktop captures the combo, so apps no longer see it. In most IDEs <kbd>Ctrl</kbd>+<kbd>Space</kbd> is "trigger suggestions", so rebind it if you miss that.
 
-**Desktops without a shortcut for fishpr** (GNOME 47 and older, sway, Hyprland, and others): bind the command `fishpr --toggle` to a key in the desktop's keyboard settings. It starts and stops recording like a tray click, so press once to start and again to stop.
+**Other desktops** (sway, Hyprland, and others) aren't supported, but may work: fishpr can't register its shortcut there, so bind the command `fishpr --toggle` to a key in the desktop's keyboard settings. It starts and stops recording like a tray click, so press once to start and again to stop.
 
 ## Pasting
 
-fishpr pastes by pressing <kbd>Ctrl</kbd>+<kbd>V</kbd> on a virtual keyboard it creates through `/dev/uinput`. Neither KWin nor GNOME lets apps fake key presses any other way. This is silent and needs no permission prompt, as long as your user can write to `/dev/uinput`.
+fishpr pastes by pressing <kbd>Ctrl</kbd>+<kbd>V</kbd> on a virtual keyboard it creates through `/dev/uinput`. KWin doesn't let apps fake key presses any other way. This is silent and needs no permission prompt, as long as your user can write to `/dev/uinput`.
 
 The fishpr package installs a udev rule that grants this. KDE Connect ships the same rule. If you built from source and don't have KDE Connect, add the rule yourself:
 
@@ -168,11 +153,10 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | Symptom | Likely cause |
 |---|---|
 | "Transcription failed: HTTP 4xx/5xx" | The endpoint is rate-limiting or has changed. Try again in a bit. |
-| "fishpr: Ctrl+Space unavailable" | GNOME 47 or older, you declined GNOME's shortcut prompt, or the desktop has no shortcut service. Bind `fishpr --toggle` to a key (see [Usage](#usage)); the tray icon still works. This is only shown once. |
-| GNOME never asked about the shortcut | The desktop entry isn't installed where GNOME looks (`/usr/share/applications` or `~/.local/share/applications`), so the portal rejected fishpr. The log says "couldn't register io.github.srafis.fishpr". |
+| "fishpr: Ctrl+Space unavailable" | The desktop isn't KDE Plasma, or KGlobalAccel isn't running. Bind `fishpr --toggle` to a key (see [Usage](#usage)); the tray icon still works. This is only shown once. |
 | "no speech detected" in the log | The voice check heard nobody. Check the input device in your desktop's sound settings. |
 | Pastes do nothing | Terminal (see above), or no `/dev/uinput` access and the portal permission was denied. |
-| No tray icon | On KDE, your panel needs the System Tray widget. On GNOME, turn on the AppIndicator extension (run the installer again to have it offered), then log out and back in. |
+| No tray icon | Your panel needs the System Tray widget. |
 | "fishpr is already running" | Another copy owns the shortcut and tray. Use `fishpr --toggle` to control it, or `pkill -x fishpr` first. |
 
 ## Project layout
@@ -182,12 +166,12 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | [`src/main.rs`](src/main.rs) | Tray icon, event loop (click / shortcut / quit), state and icon animation |
 | [`src/transcribe.rs`](src/transcribe.rs) | Client for the dictation endpoint and the local VAD check. This is the only file that knows about the backend. |
 | [`src/recorder.rs`](src/recorder.rs) | Records the mic to a WAV via `pw-record` |
-| [`src/shortcut.rs`](src/shortcut.rs) | <kbd>Ctrl</kbd>+<kbd>Space</kbd> via KGlobalAccel on KDE, the GlobalShortcuts portal elsewhere (press *and* release) |
+| [`src/shortcut.rs`](src/shortcut.rs) | <kbd>Ctrl</kbd>+<kbd>Space</kbd> via KDE's KGlobalAccel (press *and* release) |
 | [`src/control.rs`](src/control.rs) | Single instance and `fishpr --toggle`, over D-Bus |
 | [`src/hud.rs`](src/hud.rs) | The "Recording…" overlay (wlr-layer-shell, software-rendered) |
 | [`src/paste.rs`](src/paste.rs) | Ctrl+V via uinput, with the portal fallback |
-| [`src/desktop.rs`](src/desktop.rs) | Clipboard and notifications, including the recording notice where there's no overlay |
-| [`install.sh`](install.sh) | The one-line installer: adds the pacman or apt repo, installs, sets up GNOME, starts |
+| [`src/desktop.rs`](src/desktop.rs) | Clipboard and notifications |
+| [`install.sh`](install.sh) | The one-line installer: adds the pacman or apt repo, installs, starts |
 | [`packaging/`](packaging/) | `fishpr-bin` PKGBUILD, the `.deb` builder, desktop entry, uinput udev rule |
 | [`.github/workflows/release.yml`](.github/workflows/release.yml) | Builds, signs, and publishes a release to both repos when a `v*` tag is pushed |
 

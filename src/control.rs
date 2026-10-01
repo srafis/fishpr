@@ -1,8 +1,8 @@
 //! Single instance and remote control over D-Bus. The running fishpr owns the
 //! bus name `io.github.srafis.fishpr`, and `fishpr --toggle` asks it to start
 //! or stop recording, like a tray click. That's the fallback where fishpr
-//! can't register a global shortcut itself (GNOME 47 and older, most tiling
-//! compositors): bind `fishpr --toggle` to a key in the desktop's settings.
+//! can't register a global shortcut itself (any desktop but KDE Plasma): bind
+//! `fishpr --toggle` to a key in the desktop's settings.
 
 use anyhow::{Result, bail};
 use tokio::sync::mpsc::UnboundedSender;

@@ -1,5 +1,5 @@
-//! Pastes into the focused window by pressing Ctrl+V (neither KWin nor Mutter
-//! allows wtype-style fake input, so we go below or around the compositor).
+//! Pastes into the focused window by pressing Ctrl+V (KWin doesn't allow
+//! wtype-style fake input, so we go below or around the compositor).
 //!
 //! Preferred: a virtual keyboard on /dev/uinput. Silent, but needs write
 //! access to the device (KDE Connect's udev rule grants it to the logged-in
