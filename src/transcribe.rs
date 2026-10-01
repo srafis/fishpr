@@ -43,6 +43,9 @@ const RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLY_FIELD: u64 = 1_253_625;
 /// Ends the audio stream.
 const END_OF_AUDIO: [u8; 2] = [0x18, 0x01];
+/// The most audio one upload carries: 5 s of 16 kHz s16le. A replayed
+/// recording, or a backlog after a stalled upload, is split up to this size.
+const MAX_UPLOAD_BYTES: usize = 160_000;
 
 /// Silero voice activity detection (~1 MB, a few ms per clip).
 const VAD_FILE: &str = "ggml-silero-v5.1.2.bin";
@@ -56,7 +59,6 @@ pub struct Transcriber {
 /// A transcription in progress. Dropping it abandons the transcription.
 pub struct Session {
     task: JoinHandle<Result<String>>,
-    vad: Arc<Mutex<WhisperVadContext>>,
 }
 
 impl Transcriber {
@@ -83,17 +85,35 @@ impl Transcriber {
     pub fn begin(&self) -> (Session, UnboundedSender<Vec<u8>>) {
         let (audio, rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(stream(self.client.clone(), rx));
-        (Session { task, vad: self.vad.clone() }, audio)
+        (Session { task }, audio)
+    }
+
+    /// Transcribes a finished recording again, for a retry.
+    pub fn replay(&self, samples: &[i16]) -> Session {
+        let (session, audio) = self.begin();
+        for chunk in samples.chunks(MAX_UPLOAD_BYTES / 2) {
+            let _ = audio.send(chunk.iter().flat_map(|s| s.to_le_bytes()).collect());
+        }
+        session
+    }
+
+    /// Whether a local voice check hears speech in a recording.
+    pub async fn has_speech(&self, samples: &[i16]) -> Result<bool> {
+        let mut audio = vec![0.0; samples.len()];
+        whisper_rs::convert_integer_to_float_audio(samples, &mut audio)?;
+        let vad = self.vad.clone();
+        tokio::task::spawn_blocking(move || {
+            let segments = vad.lock().unwrap().segments_from_samples(WhisperVadParams::new(), &audio)?;
+            Ok(segments.count() > 0)
+        })
+        .await?
     }
 }
 
 impl Session {
-    /// Waits for the transcript, once the audio has ended. `samples` is the
-    /// whole recording, for the voice check; without speech, returns "".
-    pub async fn finish(mut self, samples: &[i16]) -> Result<String> {
-        if !has_speech(self.vad.clone(), samples).await? {
-            return Ok(String::new());
-        }
+    /// Waits for the transcript, once the audio has ended. "" means the
+    /// service heard no words.
+    pub async fn finish(mut self) -> Result<String> {
         (&mut self.task).await.context("transcription task failed")?
     }
 }
@@ -102,16 +122,6 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.task.abort();
     }
-}
-
-async fn has_speech(vad: Arc<Mutex<WhisperVadContext>>, samples: &[i16]) -> Result<bool> {
-    let mut audio = vec![0.0; samples.len()];
-    whisper_rs::convert_integer_to_float_audio(samples, &mut audio)?;
-    tokio::task::spawn_blocking(move || {
-        let segments = vad.lock().unwrap().segments_from_samples(WhisperVadParams::new(), &audio)?;
-        Ok(segments.count() > 0)
-    })
-    .await?
 }
 
 /// One WebChannel session.
@@ -164,7 +174,7 @@ impl Channel {
         let mut messages = vec![config()];
         let mut ended = false;
         while !ended {
-            // Wait for audio, then take everything recorded during the last upload too.
+            // Wait for audio, then take what was recorded during the last upload too, up to the cap.
             let mut pcm = Vec::new();
             if messages.is_empty() {
                 match audio.recv().await {
@@ -172,7 +182,7 @@ impl Channel {
                     None => ended = true,
                 }
             }
-            loop {
+            while pcm.len() < MAX_UPLOAD_BYTES {
                 match audio.try_recv() {
                     Ok(chunk) => pcm.extend(chunk),
                     Err(TryRecvError::Empty) => break,

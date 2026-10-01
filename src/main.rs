@@ -35,12 +35,14 @@ const ICON_SIZE: u32 = 64;
 const FRAME_INTERVAL: Duration = Duration::from_millis(66);
 
 /// Everything the main loop reacts to: tray clicks and `fishpr --toggle`
-/// toggle, the shortcut starts on press and stops on release.
+/// toggle, the shortcut starts on press and stops on release, and the HUD's
+/// retry button transcribes the last failed recording again.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Event {
     Toggle,
     Start,
     Stop,
+    Retry,
     Quit,
 }
 
@@ -50,6 +52,8 @@ enum State {
     Idle,
     Recording,
     Transcribing,
+    /// Idle, with the HUD offering to retry for a few seconds.
+    Failed { no_speech: bool },
 }
 
 struct Icons {
@@ -94,7 +98,7 @@ impl ksni::Tray for FishTray {
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         let icon = match self.state {
-            State::Idle => &self.icons.idle,
+            State::Idle | State::Failed { .. } => &self.icons.idle,
             State::Recording => &self.icons.active,
             State::Loading | State::Transcribing => &self.icons.loading.frames[self.frame],
         };
@@ -104,7 +108,7 @@ impl ksni::Tray for FishTray {
     fn tool_tip(&self) -> ksni::ToolTip {
         let description = match self.state {
             State::Loading => "Starting…",
-            State::Idle => "Click or hold Ctrl+Space to record",
+            State::Idle | State::Failed { .. } => "Click or hold Ctrl+Space to record",
             State::Recording => "Recording… click or release to transcribe",
             State::Transcribing => "Transcribing…",
         };
@@ -202,7 +206,12 @@ impl Ui {
             task.abort();
         }
         self.tray.update(|t| (t.state, t.frame) = (state, 0)).await;
-        if matches!(state, State::Recording) { self.hud.show() } else { self.hud.hide() }
+        match state {
+            State::Recording => self.hud.show(),
+            State::Transcribing => self.hud.busy(),
+            State::Failed { no_speech } => self.hud.fail(no_speech),
+            State::Loading | State::Idle => self.hud.hide(),
+        }
         if matches!(state, State::Loading | State::Transcribing) {
             let tray = self.tray.clone();
             self.animation = Some(tokio::spawn(async move {
@@ -227,14 +236,38 @@ fn data_dir() -> Result<PathBuf> {
     Ok(base.join("fishpr"))
 }
 
-async fn finish(recording: Recording, session: Session) -> Result<String> {
-    let samples = recording.stop().await?;
-    let text = session.finish(&samples).await?;
+/// Waits for the transcript of `samples` and puts it on the clipboard. None
+/// means nobody spoke. A retry skips the voice check, in case it was wrong.
+async fn transcribe(transcriber: &Transcriber, session: Session, samples: &[i16], check_speech: bool) -> Result<Option<String>> {
+    if check_speech && !transcriber.has_speech(samples).await? {
+        return Ok(None);
+    }
+    let text = session.finish().await?;
     if text.is_empty() {
-        anyhow::bail!("no speech detected");
+        return Ok(None);
     }
     desktop::copy_to_clipboard(&text).await?;
-    Ok(text)
+    Ok(Some(text))
+}
+
+/// Pastes a finished transcription, or offers a retry in the HUD when it
+/// failed or heard no speech. Returns the recording to keep for that retry.
+async fn settle(ui: &mut Ui, paster: &mut paste::Paster, result: Result<Option<String>>, samples: Vec<i16>) -> Option<Vec<i16>> {
+    let (no_speech, problem) = match result {
+        Ok(Some(text)) => {
+            ui.set(State::Idle).await;
+            deliver(paster, &text).await;
+            return None;
+        }
+        Ok(None) => (true, "no speech detected".to_string()),
+        Err(e) => (false, format!("{e:#}")),
+    };
+    eprintln!("fishpr: {problem}");
+    if !ui.hud.is_available() {
+        desktop::notify("Transcription failed", &problem);
+    }
+    ui.set(State::Failed { no_speech }).await;
+    Some(samples)
 }
 
 /// Pastes the transcription into the focused window. The text is already on
@@ -292,7 +325,7 @@ async fn main() -> Result<()> {
     // Without a tray host (no System Tray widget in the panel), keep running
     // without the icon; it appears if one shows up later.
     let tray = tray.assume_sni_available(true).spawn().await?;
-    let mut ui = Ui { tray, hud: hud::Hud::spawn(), animation: None };
+    let mut ui = Ui { tray, hud: hud::Hud::spawn(events_tx.clone()), animation: None };
     ui.set(State::Loading).await;
 
     // systemctl stop / Ctrl+C should also release the global shortcut.
@@ -344,12 +377,15 @@ async fn main() -> Result<()> {
     ui.set(State::Idle).await;
     let mut paster = paste::Paster::new();
     let mut recording: Option<(Recording, Session)> = None;
+    // The last recording, while it failed to transcribe and can be retried.
+    let mut failed: Option<Vec<i16>> = None;
 
     while !quit {
         let Some(event) = events.recv().await else { break };
         match (event, recording.take()) {
             (Event::Quit, _) => quit = true,
             (Event::Toggle | Event::Start, None) => {
+                failed = None;
                 // Transcription starts with the recording, so the text is ready soon after it ends.
                 let (session, audio) = transcriber.begin();
                 match Recording::start(audio, {
@@ -364,19 +400,30 @@ async fn main() -> Result<()> {
                 }
             }
             // Key auto-repeat sends more presses while held; keep recording.
-            (Event::Start, Some(r)) => recording = Some(r),
+            (Event::Start | Event::Retry, Some(r)) => recording = Some(r),
             (Event::Stop, None) => {}
+            (Event::Retry, None) => {
+                let Some(samples) = failed.take() else { continue };
+                ui.set(State::Transcribing).await;
+                let result = transcribe(&transcriber, transcriber.replay(&samples), &samples, false).await;
+                failed = settle(&mut ui, &mut paster, result, samples).await;
+                quit = drain(&mut events);
+            }
             (Event::Toggle | Event::Stop, Some((r, session))) => {
                 ui.set(State::Transcribing).await;
-                match finish(r, session).await {
-                    Ok(text) => deliver(&mut paster, &text).await,
+                match r.stop().await {
+                    Ok(samples) => {
+                        let result = transcribe(&transcriber, session, &samples, true).await;
+                        failed = settle(&mut ui, &mut paster, result, samples).await;
+                    }
+                    // Nothing was recorded, so there's nothing to retry.
                     Err(e) => {
                         eprintln!("fishpr: {e:#}");
-                        desktop::notify("Transcription failed", &format!("{e:#}"));
+                        desktop::notify("Recording failed", &format!("{e:#}"));
+                        ui.set(State::Idle).await;
                     }
                 }
                 quit = drain(&mut events);
-                ui.set(State::Idle).await;
             }
         }
     }

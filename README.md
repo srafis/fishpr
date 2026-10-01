@@ -13,11 +13,11 @@
 
 ## What it does
 
-- **Hold to talk.** Hold <kbd>Ctrl</kbd>+<kbd>Space</kbd> anywhere. A small "Recording…" pill appears at the bottom of the screen. Let go and the transcription lands in the focused window about half a second later, however long you spoke.
+- **Hold to talk.** Hold <kbd>Ctrl</kbd>+<kbd>Space</kbd> anywhere. A small black pill appears at the bottom of the screen, its bars moving with your voice. Let go and the transcription lands in the focused window about half a second later, however long you spoke.
 - **Or click the tray icon.** Click once to start, click again to stop. Tray and shortcut share one state, so you can start with one and stop with the other.
 - **Pastes for you.** The text goes on the clipboard and is pasted into the focused app with <kbd>Ctrl</kbd>+<kbd>V</kbd>. If pasting fails, it's still on your clipboard.
-- **Quiet when it works.** A notification appears only when something goes wrong.
-- **Ignores silence.** A local voice check runs on every recording, so an accidental press with nobody speaking does nothing, instead of pasting a made-up "Thank you."
+- **Retry when it fails.** If transcription fails, the pill stays for three seconds with a retry button, and a click sends the same recording again. Nothing you said is lost to a network hiccup.
+- **Ignores silence.** A local voice check runs on every recording, so an accidental press with nobody speaking pastes nothing, instead of a made-up "Thank you." The pill says "No speech detected" and offers a retry, which skips the voice check in case it was wrong.
 
 Tray icon states:
 
@@ -154,7 +154,7 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 
 | Symptom | Likely cause |
 |---|---|
-| "Transcription failed: HTTP 4xx/5xx" or "speech service error" | The service is rate-limiting or has changed. Try again in a bit. |
+| Retry keeps failing, with "HTTP 4xx/5xx" or "speech service error" in the log | The service is rate-limiting or has changed. Try again in a bit. |
 | "fishpr: Ctrl+Space unavailable" | The desktop isn't KDE Plasma, or KGlobalAccel isn't running. Bind `fishpr --toggle` to a key (see [Usage](#usage)); the tray icon still works. This is only shown once. |
 | "no speech detected" in the log | The voice check heard nobody. Check the input device in your desktop's sound settings. |
 | Pastes do nothing | Terminal (see above), or no `/dev/uinput` access and the portal permission was denied. |
@@ -170,7 +170,7 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | [`src/recorder.rs`](src/recorder.rs) | Records the mic via `pw-record`, passing the audio on as it arrives |
 | [`src/shortcut.rs`](src/shortcut.rs) | <kbd>Ctrl</kbd>+<kbd>Space</kbd> via KDE's KGlobalAccel (press *and* release) |
 | [`src/control.rs`](src/control.rs) | Single instance and `fishpr --toggle`, over D-Bus |
-| [`src/hud.rs`](src/hud.rs) | The "Recording…" overlay (wlr-layer-shell, software-rendered) |
+| [`src/hud.rs`](src/hud.rs) | The on-screen pill: level bars, spinner, retry button (wlr-layer-shell, software-rendered) |
 | [`src/paste.rs`](src/paste.rs) | Ctrl+V via uinput, with the portal fallback |
 | [`src/desktop.rs`](src/desktop.rs) | Clipboard and notifications |
 | [`install.sh`](install.sh) | The one-line installer: adds the pacman or apt repo, installs, starts |
