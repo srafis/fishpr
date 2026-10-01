@@ -13,11 +13,11 @@
 
 ## What it does
 
-- **Hold to talk.** Hold <kbd>Ctrl</kbd>+<kbd>Space</kbd> anywhere. A small "Recording…" pill appears at the bottom of the screen. Let go and the transcription lands in the focused window about half a second later.
+- **Hold to talk.** Hold <kbd>Ctrl</kbd>+<kbd>Space</kbd> anywhere. A small "Recording…" pill appears at the bottom of the screen. Let go and the transcription lands in the focused window about half a second later, however long you spoke.
 - **Or click the tray icon.** Click once to start, click again to stop. Tray and shortcut share one state, so you can start with one and stop with the other.
 - **Pastes for you.** The text goes on the clipboard and is pasted into the focused app with <kbd>Ctrl</kbd>+<kbd>V</kbd>. If pasting fails, it's still on your clipboard.
 - **Quiet when it works.** A notification appears only when something goes wrong.
-- **Ignores silence.** A local voice check runs before any result is requested, so an accidental press with nobody speaking does nothing, instead of pasting a made-up "Thank you."
+- **Ignores silence.** A local voice check runs on every recording, so an accidental press with nobody speaking does nothing, instead of pasting a made-up "Thank you."
 
 Tray icon states:
 
@@ -27,18 +27,20 @@ Tray icon states:
 
 ## How it works
 
-When you release the key, the recording is checked locally for speech and, if someone spoke, uploaded to ChatGPT's anonymous dictation endpoint (the one behind the microphone button on chatgpt.com when you're logged out). No account or API key is needed.
+While you hold the key, the audio streams to Google's speech service, the one behind the microphone button on gemini.google.com. It transcribes as you talk, so when you let go, the text is ready in about half a second. When you release the key, a local voice check also runs on the recording, and if nobody spoke, the result is thrown away. No account or API key is needed.
 
 ```
-pw-record ──WAV──▶ fishpr ── local VAD ── no speech? ──▶ drop recording
-    │                          │
-  mic                       speech ──▶ chatgpt.com/backend-anon/transcribe
-                                              │
-                                    text ──▶ clipboard + Ctrl+V
+pw-record ──PCM──▶ fishpr ──streams while you talk──▶ Google speech service
+    │                │                                         │
+  mic          on release: local VAD ── no speech? ──▶ drop    │
+                     │                                         │
+                  speech ◀──────────── text ◀──────────────────┘
+                     │
+                     └──▶ clipboard + Ctrl+V
 ```
 
 > [!WARNING]
-> **This uses an unofficial, undocumented endpoint.** OpenAI can change or block it at any time without notice. Your audio is sent to OpenAI, so don't dictate anything you wouldn't type into ChatGPT.
+> **This uses an unofficial, undocumented endpoint.** Google can change or block it at any time without notice. Your audio is sent to Google as you speak, including on an accidental press where nobody talks, so don't dictate anything you wouldn't say to Gemini.
 
 ## Requirements
 
@@ -152,7 +154,7 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 
 | Symptom | Likely cause |
 |---|---|
-| "Transcription failed: HTTP 4xx/5xx" | The endpoint is rate-limiting or has changed. Try again in a bit. |
+| "Transcription failed: HTTP 4xx/5xx" or "speech service error" | The service is rate-limiting or has changed. Try again in a bit. |
 | "fishpr: Ctrl+Space unavailable" | The desktop isn't KDE Plasma, or KGlobalAccel isn't running. Bind `fishpr --toggle` to a key (see [Usage](#usage)); the tray icon still works. This is only shown once. |
 | "no speech detected" in the log | The voice check heard nobody. Check the input device in your desktop's sound settings. |
 | Pastes do nothing | Terminal (see above), or no `/dev/uinput` access and the portal permission was denied. |
@@ -164,8 +166,8 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | File | What it does |
 |---|---|
 | [`src/main.rs`](src/main.rs) | Tray icon, event loop (click / shortcut / quit), state and icon animation |
-| [`src/transcribe.rs`](src/transcribe.rs) | Client for the dictation endpoint and the local VAD check. This is the only file that knows about the backend. |
-| [`src/recorder.rs`](src/recorder.rs) | Records the mic to a WAV via `pw-record` |
+| [`src/transcribe.rs`](src/transcribe.rs) | Streaming client for Google's speech service and the local VAD check. This is the only file that knows about the backend. |
+| [`src/recorder.rs`](src/recorder.rs) | Records the mic via `pw-record`, passing the audio on as it arrives |
 | [`src/shortcut.rs`](src/shortcut.rs) | <kbd>Ctrl</kbd>+<kbd>Space</kbd> via KDE's KGlobalAccel (press *and* release) |
 | [`src/control.rs`](src/control.rs) | Single instance and `fishpr --toggle`, over D-Bus |
 | [`src/hud.rs`](src/hud.rs) | The "Recording…" overlay (wlr-layer-shell, software-rendered) |
@@ -175,7 +177,7 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | [`packaging/`](packaging/) | `fishpr-bin` PKGBUILD, the `.deb` builder, desktop entry, uinput udev rule |
 | [`.github/workflows/release.yml`](.github/workflows/release.yml) | Builds, signs, and publishes a release to both repos when a `v*` tag is pushed |
 
-To switch transcription backends (for example to the official OpenAI API), replace `Transcriber::begin` / `Session::finish` in `transcribe.rs`. Nothing else needs to change.
+To switch transcription backends (for example to an official speech API), replace `Transcriber::begin` / `Session::finish` in `transcribe.rs`. Nothing else needs to change.
 
 Run the tests with `cargo test`.
 

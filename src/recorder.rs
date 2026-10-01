@@ -1,21 +1,17 @@
 //! Mic recording by driving `pw-record` (PipeWire) as a child process. The raw
-//! audio streams through us, so the HUD can show the live input level, and is
-//! written out as a WAV when recording stops.
+//! audio streams through us, so the HUD can show the live input level and the
+//! transcriber gets it while you're still talking.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-    sync::OnceLock,
-};
+use std::{process::Stdio, sync::OnceLock};
 
 use anyhow::{Context, Result, bail};
 use tokio::{
     io::AsyncReadExt,
     process::{Child, Command},
+    sync::mpsc::UnboundedSender,
     task::JoinHandle,
 };
 
-const SAMPLE_RATE: u32 = 16_000;
 /// Less than ~30 ms of audio means the mic never delivered anything.
 const MIN_PCM_BYTES: usize = 1024;
 /// Input levels mapped onto the meter: at or below the floor the bars sit flat
@@ -25,16 +21,16 @@ const CEIL_DB: f32 = -20.0;
 
 pub struct Recording {
     child: Child,
-    path: PathBuf,
     /// Collects the raw s16le PCM until pw-record exits.
     reader: JoinHandle<std::io::Result<Vec<u8>>>,
 }
 
 impl Recording {
-    /// Starts recording. `on_level` gets the input loudness, from 0.0 (silence
-    /// or a muted mic) to 1.0 (loud speech), about every 20 ms.
-    pub fn start(path: &Path, on_level: impl Fn(f32) + Send + 'static) -> Result<Self> {
-        let _ = std::fs::remove_file(path);
+    /// Starts recording 16 kHz mono s16le PCM, which goes to `audio` as it
+    /// arrives; the sender is dropped when recording ends. `on_level` gets the
+    /// input loudness, from 0.0 (silence or a muted mic) to 1.0 (loud speech),
+    /// about every 20 ms.
+    pub fn start(audio: UnboundedSender<Vec<u8>>, on_level: impl Fn(f32) + Send + 'static) -> Result<Self> {
         // stdbuf -o0: pw-record's stdout is otherwise block-buffered, which
         // delivers audio in 128 ms bursts and makes the meter stutter.
         let mut child = Command::new("stdbuf")
@@ -56,17 +52,18 @@ impl Recording {
                 if stdout.read_buf(&mut pcm).await? == 0 {
                     return Ok(pcm);
                 }
-                // Reads can split a sample; meter whole samples only.
+                // Reads can split a sample; pass on whole samples only.
                 let end = pcm.len() & !1;
                 on_level(level(&pcm[metered..end]));
+                let _ = audio.send(pcm[metered..end].to_vec());
                 metered = end;
             }
         });
-        Ok(Self { child, path: path.to_path_buf(), reader })
+        Ok(Self { child, reader })
     }
 
-    /// Stops recording and returns the path of the finished WAV file.
-    pub async fn stop(self) -> Result<PathBuf> {
+    /// Stops recording and returns the whole recording.
+    pub async fn stop(self) -> Result<Vec<i16>> {
         if let Some(pid) = self.child.id() {
             // SIGINT lets pw-record flush its last samples; SIGKILL would not.
             unsafe { libc::kill(pid as i32, libc::SIGINT) };
@@ -80,8 +77,7 @@ impl Recording {
             }
             bail!("recording was empty");
         }
-        write_wav(&self.path, &pcm)?;
-        Ok(self.path)
+        Ok(samples(&pcm).collect())
     }
 }
 
@@ -112,21 +108,6 @@ fn level(pcm: &[u8]) -> f32 {
     // Digital silence gives -inf dB, which clamps to 0.
     let db = 10.0 * power.log10();
     ((db - FLOOR_DB) / (CEIL_DB - FLOOR_DB)).clamp(0.0, 1.0)
-}
-
-fn write_wav(path: &Path, pcm: &[u8]) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: SAMPLE_RATE,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut wav = hound::WavWriter::create(path, spec).context("creating recording file")?;
-    for s in samples(pcm) {
-        wav.write_sample(s)?;
-    }
-    wav.finalize().context("writing recording file")?;
-    Ok(())
 }
 
 #[cfg(test)]

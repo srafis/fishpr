@@ -230,7 +230,7 @@ h2 { font-size: clamp(28px, 4vw, 42px); line-height: 1.12; letter-spacing: -0.02
   font: 650 13px var(--sans); color: var(--accent-ink); background: var(--ice); margin-bottom: 14px;
 }
 .step.local::after { content: "On your machine"; position: absolute; top: 24px; right: 18px; font-size: 11.5px; color: var(--ok); border: 1px solid rgba(110, 231, 168, 0.3); padding: 1px 8px; border-radius: 999px; }
-.step.cloud::after { content: "Sent to OpenAI"; position: absolute; top: 24px; right: 18px; font-size: 11.5px; color: var(--warn); border: 1px solid rgba(255, 197, 107, 0.3); padding: 1px 8px; border-radius: 999px; }
+.step.cloud::after { content: "Sent to Google"; position: absolute; top: 24px; right: 18px; font-size: 11.5px; color: var(--warn); border: 1px solid rgba(255, 197, 107, 0.3); padding: 1px 8px; border-radius: 999px; }
 .step h3 { margin: 0 0 6px; font-size: 16.5px; }
 .step p { margin: 0; color: var(--muted); font-size: 14.5px; }
 .step code { font-size: 0.9em; color: var(--ice); }
@@ -427,20 +427,20 @@ footer a { color: var(--muted); }
       <div class="section-head reveal">
         <div class="kicker">How it works</div>
         <h2>From your voice to your cursor in four steps.</h2>
-        <p>When you let go of the keys, fishpr checks the recording for speech and, if you said something, sends it off for transcription.</p>
+        <p>Your words are transcribed while you're still talking, so the text is ready the moment you let go.</p>
       </div>
       <div class="flow">
         <div class="step local reveal">
           <h3>Record</h3>
           <p>While you hold the keys, your mic is recorded through PipeWire with <code>pw-record</code>.</p>
         </div>
-        <div class="step local reveal">
-          <h3>Check for speech</h3>
-          <p>Silero VAD, a small voice-activity model, listens for a voice. If there's only silence, the recording is thrown away.</p>
-        </div>
         <div class="step cloud reveal">
           <h3>Transcribe</h3>
-          <p>The audio is uploaded to ChatGPT's dictation service, the one behind the microphone button on chatgpt.com.</p>
+          <p>The audio streams to Google's speech service, the one behind the microphone button on gemini.google.com, which transcribes as you talk.</p>
+        </div>
+        <div class="step local reveal">
+          <h3>Check for speech</h3>
+          <p>When you let go, Silero VAD, a small voice-activity model, checks the recording for a voice. If there was only silence, the result is thrown away.</p>
         </div>
         <div class="step local reveal">
           <h3>Paste</h3>
@@ -449,7 +449,7 @@ footer a { color: var(--muted); }
       </div>
       <div class="note reveal" role="note">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
-        <p><b>Before you install:</b> the transcription service is unofficial and undocumented, so OpenAI can change or block it at any time. Your audio is sent to OpenAI, so don't dictate anything you wouldn't type into ChatGPT. fishpr isn't affiliated with OpenAI.</p>
+        <p><b>Before you install:</b> the transcription service is unofficial and undocumented, so Google can change or block it at any time. Your audio is sent to Google as you speak, so don't dictate anything you wouldn't say to Gemini. fishpr isn't affiliated with Google.</p>
       </div>
     </div>
   </section>
@@ -535,15 +535,15 @@ footer a { color: var(--muted); }
       <div class="faq reveal">
         <details>
           <summary>Does it cost anything, or need an account?</summary>
-          <div class="a"><p>No. fishpr is free and MIT-licensed, and it doesn't need an OpenAI account or API key.</p></div>
+          <div class="a"><p>No. fishpr is free and MIT-licensed, and it doesn't need a Google account or API key.</p></div>
         </details>
         <details>
           <summary>Where does my audio go?</summary>
-          <div class="a"><p>The speech check runs on your machine, so recordings with nobody speaking never leave it. If you did speak, the recording is uploaded to OpenAI for transcription, the same as using the microphone button on chatgpt.com while logged out. Don't dictate anything you wouldn't type into ChatGPT.</p></div>
+          <div class="a"><p>While you hold the keys, your audio streams to Google for transcription, the same as using the microphone button on gemini.google.com. That includes an accidental press where nobody speaks: the speech check on your machine then throws the result away, but the audio has already been sent. Don't dictate anything you wouldn't say to Gemini.</p></div>
         </details>
         <details>
           <summary>Will it keep working?</summary>
-          <div class="a"><p>It depends on an unofficial service that OpenAI can change or block at any time. If that happens, you'll see "Transcription failed" and need to wait for a fix. The backend is isolated in one file, so moving fishpr to another service, such as OpenAI's official API, is a small change.</p></div>
+          <div class="a"><p>It depends on an unofficial service that Google can change or block at any time. If that happens, you'll see "Transcription failed" and need to wait for a fix. The backend is isolated in one file, so moving fishpr to another service, such as an official speech API, is a small change.</p></div>
         </details>
         <details>
           <summary>Does it work on GNOME?</summary>
@@ -582,7 +582,7 @@ footer a { color: var(--muted); }
 
 <footer>
   <div class="wrap">
-    <p>fishpr is <a href="https://github.com/srafis/fishpr/blob/main/LICENSE">MIT-licensed</a>. Not affiliated with OpenAI or KDE.</p>
+    <p>fishpr is <a href="https://github.com/srafis/fishpr/blob/main/LICENSE">MIT-licensed</a>. Not affiliated with Google or KDE.</p>
     <p>Voice check by <a href="https://github.com/snakers4/silero-vad">Silero VAD</a> through <a href="https://github.com/ggml-org/whisper.cpp">whisper.cpp</a>.</p>
   </div>
 </footer>

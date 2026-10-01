@@ -18,7 +18,7 @@ use ksni::TrayMethods;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use recorder::Recording;
-use transcribe::Transcriber;
+use transcribe::{Session, Transcriber};
 
 /// Matches the installed `<APP_ID>.desktop`. Portals only accept an
 /// unsandboxed app whose reverse-DNS ID has a .desktop file.
@@ -227,16 +227,9 @@ fn data_dir() -> Result<PathBuf> {
     Ok(base.join("fishpr"))
 }
 
-fn recording_path() -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    dir.join(format!("fishpr-{}.wav", std::process::id()))
-}
-
-async fn finish(recording: Recording, transcriber: &Transcriber) -> Result<String> {
-    let path = recording.stop().await?;
-    let result = transcriber.transcribe(&path).await;
-    let _ = tokio::fs::remove_file(&path).await;
-    let text = result?;
+async fn finish(recording: Recording, session: Session) -> Result<String> {
+    let samples = recording.stop().await?;
+    let text = session.finish(&samples).await?;
     if text.is_empty() {
         anyhow::bail!("no speech detected");
     }
@@ -350,29 +343,32 @@ async fn main() -> Result<()> {
     let mut quit = drain(&mut events);
     ui.set(State::Idle).await;
     let mut paster = paste::Paster::new();
-    let path = recording_path();
-    let mut recording: Option<Recording> = None;
+    let mut recording: Option<(Recording, Session)> = None;
 
     while !quit {
         let Some(event) = events.recv().await else { break };
         match (event, recording.take()) {
             (Event::Quit, _) => quit = true,
-            (Event::Toggle | Event::Start, None) => match Recording::start(&path, {
-                let hud = ui.hud.clone();
-                move |level| hud.set_level(level)
-            }) {
-                Ok(r) => {
-                    recording = Some(r);
-                    ui.set(State::Recording).await;
+            (Event::Toggle | Event::Start, None) => {
+                // Transcription starts with the recording, so the text is ready soon after it ends.
+                let (session, audio) = transcriber.begin();
+                match Recording::start(audio, {
+                    let hud = ui.hud.clone();
+                    move |level| hud.set_level(level)
+                }) {
+                    Ok(r) => {
+                        recording = Some((r, session));
+                        ui.set(State::Recording).await;
+                    }
+                    Err(e) => desktop::notify("Couldn't start recording", &format!("{e:#}")),
                 }
-                Err(e) => desktop::notify("Couldn't start recording", &format!("{e:#}")),
-            },
+            }
             // Key auto-repeat sends more presses while held; keep recording.
             (Event::Start, Some(r)) => recording = Some(r),
             (Event::Stop, None) => {}
-            (Event::Toggle | Event::Stop, Some(r)) => {
+            (Event::Toggle | Event::Stop, Some((r, session))) => {
                 ui.set(State::Transcribing).await;
-                match finish(r, &transcriber).await {
+                match finish(r, session).await {
                     Ok(text) => deliver(&mut paster, &text).await,
                     Err(e) => {
                         eprintln!("fishpr: {e:#}");
