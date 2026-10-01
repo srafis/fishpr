@@ -57,7 +57,7 @@ jobs:
           mkdir -p "dist/$TARBALL"
           cp target/release/fishpr packaging/io.github.srafis.fishpr.desktop packaging/60-fishpr-uinput.rules \
              LICENSE assets/NotoSans-OFL.txt "dist/$TARBALL/"
-          cp assets/icon-idle.png "dist/$TARBALL/fishpr.png"
+          cp assets/icon.png "dist/$TARBALL/fishpr.png"
           tar -C dist -czf "dist/$TARBALL.tar.gz" "$TARBALL"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "fishpr $VERSION" --generate-notes
           gh release upload "$TAG" "dist/$TARBALL.tar.gz" --clobber
@@ -141,7 +141,7 @@ jobs:
           mkdir -p dist/stage
           cp target/release/fishpr packaging/io.github.srafis.fishpr.desktop packaging/60-fishpr-uinput.rules \
              LICENSE assets/NotoSans-OFL.txt dist/stage/
-          cp assets/icon-idle.png dist/stage/fishpr.png
+          cp assets/icon.png dist/stage/fishpr.png
           sh packaging/deb/build.sh "$VERSION" dist/stage dist
           gh release upload "$TAG" "dist/fishpr_${VERSION}_amd64.deb" --clobber
 

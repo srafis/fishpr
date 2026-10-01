@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon-idle.png" width="160" alt="fishpr">
+  <img src="assets/icon.png" width="160" alt="fishpr">
 </p>
 
 <h1 align="center">fishpr</h1>
@@ -18,12 +18,6 @@
 - **Pastes for you.** The text goes on the clipboard and is pasted into the focused app with <kbd>Ctrl</kbd>+<kbd>V</kbd>. If pasting fails, it's still on your clipboard.
 - **Retry when it fails.** If transcription fails, the pill stays for three seconds with a retry button, and a click sends the same recording again. Nothing you said is lost to a network hiccup.
 - **Ignores silence.** A local voice check runs on every recording, so an accidental press with nobody speaking pastes nothing, instead of a made-up "Thank you." The pill says "No speech detected" and offers a retry, which skips the voice check in case it was wrong.
-
-Tray icon states:
-
-| Idle | Recording | Transcribing |
-|:---:|:---:|:---:|
-| <img src="assets/icon-idle.png" width="64"> | <img src="assets/icon-active.png" width="64"> | <img src="assets/icon-loading.gif" width="64"> |
 
 ## How it works
 
