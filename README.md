@@ -16,7 +16,7 @@
 - **Hold to talk.** Hold <kbd>Ctrl</kbd>+<kbd>Space</kbd> anywhere. A small black pill appears at the bottom of the screen, its bars moving with your voice. Let go and the transcription lands in the focused window about half a second later, however long you spoke.
 - **Or click the tray icon.** Click once to start, click again to stop. Tray and shortcut share one state, so you can start with one and stop with the other.
 - **Pastes for you.** The text goes on the clipboard and is pasted into the focused app with <kbd>Ctrl</kbd>+<kbd>V</kbd>. If pasting fails, it's still on your clipboard.
-- **Retry when it fails.** If transcription fails, the pill stays for three seconds with a retry button, and a click sends the same recording again. Nothing you said is lost to a network hiccup.
+- **Retry when it fails.** If transcription fails, the pill stays for ten seconds with a retry button, and a click sends the same recording again. Nothing you said is lost to a network hiccup.
 - **Ignores silence.** A local voice check runs on every recording, so an accidental press with nobody speaking pastes nothing, instead of a made-up "Thank you." The pill says "No speech detected" and offers a retry, which skips the voice check in case it was wrong.
 
 ## How it works

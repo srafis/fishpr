@@ -51,7 +51,7 @@ const FONT: &[u8] = include_bytes!("../assets/NotoSans-Medium.ttf");
 const NO_SPEECH: &str = "No speech detected";
 
 // Sizes are in logical pixels.
-const FONT_SIZE: f32 = 11.25;
+const FONT_SIZE: f32 = 16.0;
 const HEIGHT: f32 = 33.0;
 /// Space between each end of the pill and the bars, while recording.
 const PAD: f32 = 16.5;
@@ -75,7 +75,7 @@ const BOTTOM_MARGIN: i32 = 96;
 const ENTER_SECS: f32 = 0.45;
 const LEAVE_SECS: f32 = 0.18;
 /// How long the retry button stays, not counting while the pointer is on it.
-const RETRY_SECS: f32 = 3.0;
+const RETRY_SECS: f32 = 10.0;
 /// How fast the pill reshapes between states, per second.
 const MORPH_RATE: f32 = 14.0;
 /// How fast the meter follows the input level, per second. It rises quickly
@@ -203,6 +203,8 @@ fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
         no_speech: false,
         countdown: 0.0,
         hovered: false,
+        on_button: false,
+        enter_serial: 0,
         label,
     };
     loop {
@@ -263,8 +265,12 @@ struct HudState {
     no_speech: bool,
     /// Seconds left before the retry button goes away.
     countdown: f32,
-    /// Whether the pointer is on the retry button.
+    /// Whether the pointer is on the pill, which pauses the countdown, and
+    /// whether it's on the retry button.
     hovered: bool,
+    on_button: bool,
+    /// The pointer's latest entry onto the pill, which changing the cursor needs.
+    enter_serial: u32,
     label: Label,
 }
 
@@ -299,7 +305,7 @@ impl HudState {
         self.started = self.since;
         self.last_frame = self.since;
         self.frame_pending = false;
-        self.hovered = false;
+        (self.hovered, self.on_button) = (false, false);
         (self.level, self.target_level) = (0.0, 0.0);
         // Appear already in shape, rather than morphing while popping in.
         self.open = if self.mode == Mode::Recording { 0.0 } else { 1.0 };
@@ -328,20 +334,41 @@ impl HudState {
         }
     }
 
-    /// Clicks go through the HUD, except on the retry button while it's offered.
+    /// Where the failed pill sits once settled, centered in the surface: its
+    /// left edge, its width, and the middle of its retry button.
+    fn failed_layout(&self) -> (f32, f32, (f32, f32)) {
+        let content = if self.no_speech { self.label.width } else { BARS_W };
+        let pw = pill_width(content, 1.0);
+        let left = (self.surface_width() as f32 - pw) / 2.0;
+        (left, pw, (left + pw - SLOT_INSET - SLOT / 2.0, SURFACE_H as f32 / 2.0))
+    }
+
+    /// Clicks go through the HUD, except while it offers a retry: then the
+    /// pill takes the pointer, so resting on it pauses the countdown.
     fn update_input_region(&mut self) {
         let Some(layer) = &self.layer else { return };
         let Ok(region) = Region::new(&self.compositor) else { return };
         if self.mode == Mode::Failed && self.phase != Phase::Leaving {
-            // Where the button is once the pill has settled; it's centered in the surface.
-            let content = if self.no_speech { self.label.width } else { BARS_W };
-            let x = (self.surface_width() as f32 + pill_width(content, 1.0)) / 2.0 - SLOT_INSET - SLOT;
-            let y = (SURFACE_H as f32 - SLOT) / 2.0;
-            region.add(x as i32, y as i32, SLOT as i32, SLOT as i32);
+            let (left, pw, _) = self.failed_layout();
+            let top = (SURFACE_H as f32 - HEIGHT) / 2.0;
+            region.add(left as i32, top as i32, pw.ceil() as i32, HEIGHT as i32);
         } else {
-            self.hovered = false;
+            (self.hovered, self.on_button) = (false, false);
         }
         layer.wl_surface().set_input_region(Some(region.wl_region()));
+    }
+
+    /// Tracks whether the pointer, at `(x, y)` on the surface, is on the
+    /// retry button, and shows a hand there.
+    fn point_at(&mut self, (x, y): (f64, f64)) {
+        let (_, _, (bx, by)) = self.failed_layout();
+        let on_button = (x as f32 - bx).hypot(y as f32 - by) <= SLOT / 2.0 + 1.0;
+        if on_button != self.on_button || !self.hovered {
+            if let Some((_, Some(shape))) = &self.pointer {
+                shape.set_shape(self.enter_serial, if on_button { Shape::Pointer } else { Shape::Default });
+            }
+        }
+        (self.hovered, self.on_button) = (true, on_button);
     }
 
     fn draw(&mut self) {
@@ -406,7 +433,7 @@ impl HudState {
             failed: self.failed,
             labelled: self.labelled,
             left: (self.countdown / RETRY_SECS).clamp(0.0, 1.0),
-            hovered: self.hovered,
+            hovered: self.on_button,
         };
         paint_pill(&mut pixmap, s as f32, &look, &self.label);
 
@@ -527,6 +554,7 @@ struct Look {
     labelled: f32,
     /// How much of the retry window is left.
     left: f32,
+    /// Whether the pointer is on the retry button.
     hovered: bool,
 }
 
@@ -730,7 +758,7 @@ impl SeatHandler for HudState {
 }
 
 impl PointerHandler for HudState {
-    // The input region is only the retry button, so any pointer event is on it.
+    // The pill only takes the pointer while it offers a retry.
     fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         for event in events {
             if self.layer.as_ref().is_none_or(|layer| layer.wl_surface() != &event.surface) {
@@ -738,13 +766,13 @@ impl PointerHandler for HudState {
             }
             match event.kind {
                 PointerEventKind::Enter { serial } => {
-                    self.hovered = true;
-                    if let Some((_, Some(shape))) = &self.pointer {
-                        shape.set_shape(serial, Shape::Pointer);
-                    }
+                    self.enter_serial = serial;
+                    self.hovered = false; // so point_at sets the cursor
+                    self.point_at(event.position);
                 }
-                PointerEventKind::Leave { .. } => self.hovered = false,
-                PointerEventKind::Press { button: BUTTON_LEFT, .. } if self.mode == Mode::Failed && self.phase != Phase::Leaving => {
+                PointerEventKind::Motion { .. } => self.point_at(event.position),
+                PointerEventKind::Leave { .. } => (self.hovered, self.on_button) = (false, false),
+                PointerEventKind::Press { button: BUTTON_LEFT, .. } if self.on_button && self.mode == Mode::Failed && self.phase != Phase::Leaving => {
                     let _ = self.events.send(Event::Retry);
                     self.set_mode(Mode::Busy);
                 }
