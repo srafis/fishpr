@@ -39,7 +39,7 @@ pw-record ──PCM──▶ fishpr ──streams while you talk──▶ Google
 ## Requirements
 
 - **KDE Plasma 6, on Wayland.** GNOME isn't supported.
-- **Arch Linux, Ubuntu 24.04 or later, or Debian 13 or later, on x86_64** for the one-line installer. On anything else, [build from source](#build-from-source).
+- **Arch Linux, Ubuntu 24.04 or later, Debian 13 or later, or Fedora 42 or later, on x86_64** for the one-line installer. On anything else, [build from source](#build-from-source).
 
 ## Install
 
@@ -51,6 +51,7 @@ The installer adds fishpr's signed package repo and installs fishpr from it:
 
 - **Arch:** adds the `[fishpr]` repo to `/etc/pacman.conf` and installs `fishpr-bin`. It uses `pacman -Syu`, so it also upgrades the rest of your system.
 - **Ubuntu and Debian:** adds `/etc/apt/sources.list.d/fishpr.sources`, with the signing key in `/etc/apt/keyrings/fishpr.asc` (trusted for fishpr's repo only), and installs `fishpr`.
+- **Fedora:** downloads the signed `fishpr` RPM, checks its signature against fishpr's key (which isn't added to your system's keys), and installs it with `dnf`. There's no dnf repo, so nothing is added to your system's sources.
 
 The package brings in the dependencies (PipeWire, wl-clipboard, libnotify), installs the [uinput rule](#pasting) for silent pasting, and makes fishpr start on login. The installer then starts fishpr.
 
@@ -58,7 +59,7 @@ If you installed fishpr by hand before, delete `~/.local/bin/fishpr` and `~/.con
 
 ### Updating
 
-New versions arrive with your normal system upgrade (`sudo pacman -Syu` or `yay` on Arch, `sudo apt upgrade` on Ubuntu and Debian). The running copy keeps its old version until you restart it: run `pkill -x fishpr`, then launch fishpr from the app menu. Or run the install command again, which updates and restarts it in one go.
+New versions arrive with your normal system upgrade (`sudo pacman -Syu` or `yay` on Arch, `sudo apt upgrade` on Ubuntu and Debian). The running copy keeps its old version until you restart it: run `pkill -x fishpr`, then launch fishpr from the app menu. Or run the install command again, which updates and restarts it in one go. On Fedora that's the only way to update, since fishpr isn't in a dnf repo.
 
 ### Uninstall
 
@@ -77,6 +78,12 @@ sudo apt purge fishpr
 sudo rm /etc/apt/sources.list.d/fishpr.sources /etc/apt/keyrings/fishpr.asc
 ```
 
+On Fedora:
+
+```sh
+sudo dnf remove fishpr
+```
+
 The downloaded model and settings are in `~/.local/share/fishpr/`.
 
 ### Build from source
@@ -91,6 +98,12 @@ On Ubuntu or Debian, install Rust with [rustup](https://rustup.rs) (the distro's
 
 ```sh
 sudo apt install build-essential cmake clang libclang-dev pipewire-bin wl-clipboard libnotify-bin
+```
+
+On Fedora (the distro's Rust may be too old, so use [rustup](https://rustup.rs) if `rustc --version` is below 1.85):
+
+```sh
+sudo dnf install rust cargo cmake clang clang-devel gcc-c++ pipewire-utils wl-clipboard libnotify
 ```
 
 Then build and install:
@@ -167,9 +180,9 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | [`src/hud.rs`](src/hud.rs) | The on-screen pill: level bars, spinner, retry button (wlr-layer-shell, software-rendered) |
 | [`src/paste.rs`](src/paste.rs) | Ctrl+V via uinput, with the portal fallback |
 | [`src/desktop.rs`](src/desktop.rs) | Clipboard and notifications |
-| [`install.sh`](install.sh) | The one-line installer: adds the pacman or apt repo, installs, starts |
-| [`packaging/`](packaging/) | `fishpr-bin` PKGBUILD, the `.deb` builder, desktop entry, uinput udev rule |
-| [`.github/workflows/release.yml`](.github/workflows/release.yml) | Builds, signs, and publishes a release to both repos when a `v*` tag is pushed |
+| [`install.sh`](install.sh) | The one-line installer: adds the pacman or apt repo, or downloads the Fedora RPM, installs, starts |
+| [`packaging/`](packaging/) | `fishpr-bin` PKGBUILD, the `.deb` builder, the RPM spec, desktop entry, uinput udev rule |
+| [`.github/workflows/release.yml`](.github/workflows/release.yml) | Builds, signs, and publishes a release to the pacman and apt repos and the Fedora RPM when a `v*` tag is pushed |
 
 To switch transcription backends (for example to an official speech API), replace `Transcriber::begin` / `Session::finish` in `transcribe.rs`. Nothing else needs to change.
 
@@ -177,7 +190,7 @@ Run the tests with `cargo test`.
 
 ## Releasing
 
-Releases are built by CI. The pacman repo lives in the assets of the GitHub release tagged `repo`: the package, its database, and the public signing key that `install.sh` imports. The apt repo lives the same way in the release tagged `apt`, signed with the same key. The `.deb` is built on Ubuntu 24.04, so it runs on that release's glibc and anything newer.
+Releases are built by CI. The pacman repo lives in the assets of the GitHub release tagged `repo`: the package, its database, and the public signing key that `install.sh` imports. The apt repo lives the same way in the release tagged `apt`, signed with the same key. The `.deb` is built on Ubuntu 24.04, so it runs on that release's glibc and anything newer. The Fedora RPM is built in a Fedora 42 container and signed with the same key. It isn't a dnf repo, because dnf needs a `repodata/` directory and release assets can't have paths. The release tagged `rpm` holds the current RPM as `fishpr.x86_64.rpm`, plus the public key, and `install.sh` downloads those.
 
 **One-time setup:** create a signing key without a passphrase and store it as a repo secret. Keep a backup of the key somewhere safe.
 

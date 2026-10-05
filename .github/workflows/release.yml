@@ -5,9 +5,11 @@
 #   4. build fishpr_<ver>_amd64.deb on Ubuntu 24.04 (its glibc is the oldest we
 #      support), attach it to the v0.2.0 release, and publish it to the apt repo
 #      stored in the `apt` release
+#   5. build fishpr-<ver>-1.x86_64.rpm on Fedora 42, attach it to the v0.2.0 release,
+#      and publish it as fishpr.x86_64.rpm in the `rpm` release
 #
 # Needs the GPG_PRIVATE_KEY secret: an armored, passphrase-less signing key.
-# Both repos are signed with it.
+# The repos and the RPM are all signed with it.
 
 name: Release
 
@@ -186,3 +188,63 @@ jobs:
               fishpr_*.deb) gh release delete-asset apt "$asset" --yes ;;
             esac
           done
+
+  rpm:
+    name: Fedora (dnf)
+    # After `pacman`, which creates the v<ver> GitHub release this uploads to.
+    needs: pacman
+    runs-on: ubuntu-latest
+    # Built on a Fedora release that's still supported, so the binary runs on it and on anything newer.
+    container: fedora:42
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      GGML_NATIVE: 'OFF'
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y git gcc gcc-c++ cmake clang clang-devel rpm-build rpm-sign gnupg2 gh
+          # Fedora's own Rust can lag behind edition 2024.
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: |
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          cargo build --release --locked
+
+      - name: Build package
+        run: |
+          mkdir -p dist/stage
+          cp target/release/fishpr packaging/io.github.srafis.fishpr.desktop packaging/60-fishpr-uinput.rules \
+             LICENSE assets/NotoSans-OFL.txt dist/stage/
+          cp assets/icon.png dist/stage/fishpr.png
+          rpmbuild -bb --define "pkgver $VERSION" --define "stage $PWD/dist/stage" --define "_rpmdir $PWD/dist" \
+            packaging/rpm/fishpr.spec
+
+      - name: Sign and publish
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::error::the GPG_PRIVATE_KEY secret isn't set"
+            exit 1
+          fi
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          fpr=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ { print $10; exit }')
+
+          rpm="dist/x86_64/fishpr-$VERSION-1.x86_64.rpm"
+          rpmsign --define "_gpg_name $fpr" --addsign "$rpm"
+          gh release upload "$TAG" "$rpm" --clobber
+
+          # Not a dnf repo, which needs a repodata/ directory that release assets can't have.
+          # install.sh downloads this one stable name, so updating means running it again.
+          mkdir rpm
+          cp "$rpm" rpm/fishpr.x86_64.rpm
+          gpg --armor --export "$fpr" > rpm/fishpr.gpg
+          gh release view rpm >/dev/null 2>&1 || gh release create rpm --latest=false \
+            --title "rpm" --notes "Storage for fishpr's Fedora package. Install with install.sh in the repo root."
+          gh release upload rpm rpm/fishpr.x86_64.rpm rpm/fishpr.gpg --clobber

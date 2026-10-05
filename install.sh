@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs fishpr from its signed package repo (pacman on Arch, apt on Ubuntu
-# and Debian), then starts fishpr.
+# and Debian) or as a signed package (dnf on Fedora), then starts fishpr.
 #
 #   curl -fsSL https://raw.githubusercontent.com/srafis/fishpr/main/install.sh | sh
 #   wget -qO- https://raw.githubusercontent.com/srafis/fishpr/main/install.sh | sh
@@ -8,7 +8,8 @@
 # (Ubuntu and Debian ship wget but not curl.)
 #
 # Safe to run again. After the first run, the system's normal upgrades
-# (`pacman -Syu`, `apt upgrade`) keep fishpr updated.
+# (`pacman -Syu`, `apt upgrade`) keep fishpr updated. On Fedora, run this again
+# to update.
 
 set -eu
 
@@ -65,6 +66,21 @@ install_apt() {
     sudo apt-get install fishpr </dev/tty
 }
 
+install_dnf() {
+    fetch "$RELEASES/rpm/fishpr.gpg" "$tmp/fishpr.gpg" || die "couldn't download the signing key"
+    fetch "$RELEASES/rpm/fishpr.x86_64.rpm" "$tmp/fishpr.rpm" || die "couldn't download the package"
+
+    # Checked against a throwaway key database, so the key isn't trusted for anything else.
+    echo "==> Checking the package signature"
+    mkdir "$tmp/rpmdb"
+    rpmkeys --dbpath "$tmp/rpmdb" --import "$tmp/fishpr.gpg" || die "couldn't read the signing key"
+    rpmkeys --dbpath "$tmp/rpmdb" --checksig "$tmp/fishpr.rpm" | grep -q 'signatures OK' ||
+        die "the package's signature doesn't check out"
+
+    echo "==> Installing fishpr"
+    sudo dnf install "$tmp/fishpr.rpm" </dev/tty
+}
+
 main() {
     [ "$(id -u)" -ne 0 ] || die "run this as your normal user; it asks for sudo when it needs it"
     [ "$(uname -m)" = x86_64 ] || die "only x86_64 builds are published"
@@ -72,8 +88,10 @@ main() {
         pm=pacman
     elif command -v apt-get >/dev/null; then
         pm=apt
+    elif command -v dnf >/dev/null; then
+        pm=dnf
     else
-        die "there's no fishpr package for this distro yet (Arch, Ubuntu, and Debian are supported); see https://github.com/srafis/fishpr#build-from-source"
+        die "there's no fishpr package for this distro yet (Arch, Ubuntu, Debian, and Fedora are supported); see https://github.com/srafis/fishpr#build-from-source"
     fi
 
     tmp=$(mktemp -d)
