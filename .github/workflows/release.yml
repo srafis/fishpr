@@ -22,7 +22,8 @@ concurrency:
   group: release
 
 jobs:
-  release:
+  pacman:
+    name: Arch (pacman)
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     env:
@@ -108,9 +109,10 @@ jobs:
             esac
           done
 
-  deb:
-    # After `release`, which creates the v<ver> GitHub release this uploads to.
-    needs: release
+  apt:
+    name: Ubuntu/Debian (apt)
+    # After `pacman`, which creates the v<ver> GitHub release this uploads to.
+    needs: pacman
     runs-on: ubuntu-latest
     container: ubuntu:24.04
     env:

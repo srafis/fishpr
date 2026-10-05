@@ -42,7 +42,7 @@ Run the whole release without checking in at each step. Stop and ask only in the
 Read the log with `gh run view <id> --log-failed`.
 
 - **A transient failure** (network, container): run `gh run rerun <id>`. Uploads use `--clobber`, so a rerun is safe.
-- **Only the `deb` job failed:** the pacman repo already has the release. Fix the cause, then run `gh run rerun <id> --failed` if the fix is outside the repo, or release the fix as the next patch.
+- **Only the `apt` job failed:** the pacman repo already has the release. Fix the cause, then run `gh run rerun <id> --failed` if the fix is outside the repo, or release the fix as the next patch.
 - **A code fix is needed and "Sign and publish to the pacman repo" never ran:**
   1. Run `gh release delete vX.Y.Z --yes --cleanup-tag` and `git tag -d vX.Y.Z`.
   2. Fix the code.
