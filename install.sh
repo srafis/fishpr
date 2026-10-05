@@ -2,8 +2,8 @@
 # Installs fishpr from its signed package repo (pacman on Arch, apt on Ubuntu
 # and Debian) or as a signed package (dnf on Fedora), then starts fishpr.
 #
-#   curl -fsSL https://raw.githubusercontent.com/srafis/fishpr/main/install.sh | sh
-#   wget -qO- https://raw.githubusercontent.com/srafis/fishpr/main/install.sh | sh
+#   curl -fsSL https://fishpr.s.gy | sh
+#   wget -qO- https://fishpr.s.gy | sh
 #
 # (Ubuntu and Debian ship wget but not curl.)
 #

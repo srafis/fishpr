@@ -44,7 +44,7 @@ pw-record ──PCM──▶ fishpr ──streams while you talk──▶ Google
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/srafis/fishpr/main/install.sh | sh
+curl -fsSL https://fishpr.s.gy | sh
 ```
 
 The installer adds fishpr's signed package repo and installs fishpr from it:
@@ -182,6 +182,7 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | [`src/desktop.rs`](src/desktop.rs) | Clipboard and notifications |
 | [`install.sh`](install.sh) | The one-line installer: adds the pacman or apt repo, or downloads the Fedora RPM, installs, starts |
 | [`packaging/`](packaging/) | `fishpr-bin` PKGBUILD, the `.deb` builder, the RPM spec, desktop entry, uinput udev rule |
+| [`site/`](site/) | The marketing page, published to GitHub Pages by [`pages.yml`](.github/workflows/pages.yml) when it changes on `main` |
 | [`.github/workflows/release.yml`](.github/workflows/release.yml) | Builds, signs, and publishes a release to the pacman and apt repos and the Fedora RPM when a `v*` tag is pushed |
 
 To switch transcription backends (for example to an official speech API), replace `Transcriber::begin` / `Session::finish` in `transcribe.rs`. Nothing else needs to change.
