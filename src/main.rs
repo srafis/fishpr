@@ -32,7 +32,7 @@ const ICON_SIZE: u32 = 64;
 /// toggle, the shortcut starts on press and stops on release, and the HUD's
 /// retry button transcribes the last failed recording again. The paste-last
 /// shortcut pastes the last transcription again, and the HUD's copy button
-/// copies it.
+/// copies it. Esc, while the HUD shows, cancels or dismisses what it shows.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Event {
     Toggle,
@@ -41,6 +41,7 @@ pub enum Event {
     Retry,
     PasteLast,
     CopyLast,
+    Dismiss,
     Quit,
 }
 
@@ -51,7 +52,7 @@ enum State {
     Recording,
     Transcribing,
     /// Idle, with the HUD offering to retry for a few seconds.
-    Failed { no_speech: bool },
+    Failed { why: hud::Failure },
 }
 
 /// The tray icon is the same in every state; the HUD shows what's going on.
@@ -153,7 +154,7 @@ impl Ui {
         match state {
             State::Recording => self.hud.show(),
             State::Transcribing => self.hud.busy(),
-            State::Failed { no_speech } => self.hud.fail(no_speech),
+            State::Failed { why } => self.hud.fail(why),
             State::Loading | State::Idle => self.hud.hide(),
         }
     }
@@ -202,21 +203,45 @@ async fn settle(
     result: Result<Option<String>>,
     samples: Vec<i16>,
 ) -> Option<Vec<i16>> {
-    let (no_speech, problem) = match result {
+    let (why, problem) = match result {
         Ok(Some(text)) => {
             deliver(ui, paster, &text).await;
             *last = Some(text);
             return None;
         }
-        Ok(None) => (true, "no speech detected".to_string()),
-        Err(e) => (false, format!("{e:#}")),
+        Ok(None) => (hud::Failure::NoSpeech, "no speech detected".to_string()),
+        Err(e) => (hud::Failure::Error, format!("{e:#}")),
     };
     eprintln!("fishpr: {problem}");
     if !ui.hud.is_available() {
         desktop::notify("Transcription failed", &problem);
     }
-    ui.set(State::Failed { no_speech }).await;
+    ui.set(State::Failed { why }).await;
     Some(samples)
+}
+
+/// Offers to transcribe `samples` after all, when the user cancelled with Esc.
+async fn cancel(ui: &mut Ui, samples: Vec<i16>) -> Option<Vec<i16>> {
+    eprintln!("fishpr: cancelled");
+    ui.set(State::Failed { why: hud::Failure::Cancelled }).await;
+    Some(samples)
+}
+
+/// Runs `work` unless the user presses Esc first. Input meanwhile is
+/// dropped, as `drain` does, except Quit, which takes effect once `work` is done.
+async fn unless_dismissed<T>(work: impl Future<Output = T>, events: &mut mpsc::UnboundedReceiver<Event>, quit: &mut bool) -> Option<T> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            done = &mut work => return Some(done),
+            event = events.recv() => match event {
+                Some(Event::Dismiss) => return None,
+                Some(Event::Quit) => *quit = true,
+                Some(_) => {}
+                None => return Some(work.await),
+            },
+        }
+    }
 }
 
 /// Pastes the transcription into the focused window. When nothing takes it
@@ -286,7 +311,7 @@ async fn main() -> Result<()> {
     // Said once rather than at every login: where there's no KGlobalAccel
     // (desktops other than Plasma), the user binds `fishpr --toggle` once and is done.
     let told_marker = data_dir().map(|d| d.join("shortcut-unavailable"));
-    let shortcut = match shortcut::Shortcut::register(events_tx.clone()).await {
+    let shortcut = match shortcut::Shortcut::register(events_tx.clone(), ui.hud.visibility()).await {
         Ok(s) => {
             if let Ok(marker) = &told_marker {
                 let _ = std::fs::remove_file(marker);
@@ -349,10 +374,23 @@ async fn main() -> Result<()> {
             // Key auto-repeat sends more presses while held; keep recording.
             (Event::Start | Event::Retry | Event::PasteLast, Some(r)) => recording = Some(r),
             (Event::Stop, None) => {}
+            // Hides the retry button or the card.
+            (Event::Dismiss, None) => {
+                failed = None;
+                ui.set(State::Idle).await;
+            }
+            // Stops recording without transcribing; the retry button transcribes it after all.
+            (Event::Dismiss, Some((r, _session))) => match r.stop().await {
+                Ok(samples) => failed = cancel(&mut ui, samples).await,
+                Err(e) => {
+                    eprintln!("fishpr: {e:#}");
+                    ui.set(State::Idle).await;
+                }
+            },
             (Event::PasteLast, None) => {
                 let Some(text) = last.clone() else { continue };
                 deliver(&mut ui, &mut paster, &text).await;
-                quit = drain(&mut events);
+                quit |= drain(&mut events);
             }
             (Event::CopyLast, r) => {
                 recording = r;
@@ -365,16 +403,22 @@ async fn main() -> Result<()> {
             (Event::Retry, None) => {
                 let Some(samples) = failed.take() else { continue };
                 ui.set(State::Transcribing).await;
-                let result = transcribe(&transcriber, transcriber.replay(&samples), &samples, false).await;
-                failed = settle(&mut ui, &mut paster, &mut last, result, samples).await;
-                quit = drain(&mut events);
+                let work = transcribe(&transcriber, transcriber.replay(&samples), &samples, false);
+                failed = match unless_dismissed(work, &mut events, &mut quit).await {
+                    Some(result) => settle(&mut ui, &mut paster, &mut last, result, samples).await,
+                    None => cancel(&mut ui, samples).await,
+                };
+                quit |= drain(&mut events);
             }
             (Event::Toggle | Event::Stop, Some((r, session))) => {
                 ui.set(State::Transcribing).await;
                 match r.stop().await {
                     Ok(samples) => {
-                        let result = transcribe(&transcriber, session, &samples, true).await;
-                        failed = settle(&mut ui, &mut paster, &mut last, result, samples).await;
+                        let work = transcribe(&transcriber, session, &samples, true);
+                        failed = match unless_dismissed(work, &mut events, &mut quit).await {
+                            Some(result) => settle(&mut ui, &mut paster, &mut last, result, samples).await,
+                            None => cancel(&mut ui, samples).await,
+                        };
                     }
                     // Nothing was recorded, so there's nothing to retry.
                     Err(e) => {
@@ -383,7 +427,7 @@ async fn main() -> Result<()> {
                         ui.set(State::Idle).await;
                     }
                 }
-                quit = drain(&mut events);
+                quit |= drain(&mut events);
             }
         }
     }

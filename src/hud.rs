@@ -1,7 +1,8 @@
 //! A black pill at the bottom of the screen, drawn as a wlr-layer-shell
 //! overlay (KWin supports it). While recording, its bars follow the mic; while
 //! transcribing, a spinner joins them; if that fails, a retry button takes the
-//! spinner's place for a few seconds. When a transcription has nowhere to
+//! spinner's place for a few seconds, as it does when the user cancels with
+//! Esc. When a transcription has nowhere to
 //! paste, the pill grows into a card that shows it with a copy button, for a
 //! few seconds. It never takes focus, and takes clicks only while it offers a
 //! retry or the card. Runs on its own thread with its own Wayland connection.
@@ -45,12 +46,13 @@ use std::{
     time::Instant,
 };
 use tiny_skia::{Color, FillRule, FilterQuality, IntSize, LineCap, Paint, Path, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::Event;
 
 const FONT: &[u8] = include_bytes!("../assets/NotoSans-Medium.ttf");
 const NO_SPEECH: &str = "No speech detected";
+const CANCELLED: &str = "Cancelled";
 const HINT: &str = "Select a text field first, then dictate";
 
 // Sizes are in logical pixels.
@@ -79,6 +81,8 @@ const ENTER_SECS: f32 = 0.45;
 const LEAVE_SECS: f32 = 0.18;
 /// How long the retry button stays, not counting while the pointer is on it.
 const RETRY_SECS: f32 = 10.0;
+/// The same, after the user cancelled.
+const CANCELLED_SECS: f32 = 3.0;
 /// How fast the pill reshapes between states, per second.
 const MORPH_RATE: f32 = 14.0;
 /// How fast the meter follows the input level, per second. It rises quickly
@@ -113,10 +117,21 @@ const OFFER_SECS: f32 = 10.0;
 /// How long the copy button says "Copied" before the card goes.
 const COPIED_SECS: f32 = 0.7;
 
+/// Why the pill offers a retry.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Failure {
+    /// Transcription failed; the bars turn red.
+    Error,
+    /// The voice check heard nobody, which the pill says.
+    NoSpeech,
+    /// The user pressed Esc, which the pill says.
+    Cancelled,
+}
+
 enum Msg {
     Show,
     Busy,
-    Fail { no_speech: bool },
+    Fail(Failure),
     Offer(String),
     Hide,
     Level(f32),
@@ -126,6 +141,7 @@ enum Msg {
 pub struct Hud {
     tx: Sender<Msg>,
     available: Arc<AtomicBool>,
+    visible: watch::Receiver<bool>,
 }
 
 impl Hud {
@@ -135,16 +151,23 @@ impl Hud {
     pub fn spawn(events: UnboundedSender<Event>) -> Self {
         let (tx, rx) = channel::channel();
         let available = Arc::new(AtomicBool::new(true));
+        let (visible_tx, visible) = watch::channel(false);
         std::thread::spawn({
             let available = available.clone();
             move || {
-                if let Err(e) = run(rx, events) {
+                if let Err(e) = run(rx, events, visible_tx) {
                     eprintln!("fishpr: HUD disabled: {e:#}");
                     available.store(false, Ordering::Relaxed);
                 }
             }
         });
-        Self { tx, available }
+        Self { tx, available, visible }
+    }
+
+    /// Whether the HUD is on screen, as it changes, including when it goes
+    /// away by itself.
+    pub fn visibility(&self) -> watch::Receiver<bool> {
+        self.visible.clone()
     }
 
     pub fn is_available(&self) -> bool {
@@ -161,10 +184,10 @@ impl Hud {
         let _ = self.tx.send(Msg::Busy);
     }
 
-    /// Offers a retry button for a few seconds, then hides. With
-    /// `no_speech`, says so next to the button, in place of the bars.
-    pub fn fail(&self, no_speech: bool) {
-        let _ = self.tx.send(Msg::Fail { no_speech });
+    /// Offers a retry button for a few seconds, then hides. Says why next
+    /// to the button, in place of the bars, unless it was an error.
+    pub fn fail(&self, why: Failure) {
+        let _ = self.tx.send(Msg::Fail(why));
     }
 
     /// Grows into a card that shows `text`, with a copy button, for a few
@@ -183,7 +206,7 @@ impl Hud {
     }
 }
 
-fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
+fn run(rx: Channel<Msg>, events: UnboundedSender<Event>, visible: watch::Sender<bool>) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
@@ -196,8 +219,8 @@ fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
                 match msg {
                     Msg::Show => state.set_mode(Mode::Recording),
                     Msg::Busy => state.set_mode(Mode::Busy),
-                    Msg::Fail { no_speech } => {
-                        state.no_speech = no_speech;
+                    Msg::Fail(why) => {
+                        state.failure = why;
                         state.set_mode(Mode::Failed);
                     }
                     Msg::Offer(text) => {
@@ -214,6 +237,7 @@ fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
     let font = FontRef::try_from_slice(FONT)?;
     let labels = Labels {
         no_speech: Label::new(&font, NO_SPEECH, FONT_SIZE),
+        cancelled: Label::new(&font, CANCELLED, FONT_SIZE),
         hint: Label::new(&font, HINT, HINT_SIZE),
         copy: Label::new(&font, "Copy", FONT_SIZE),
         copied: Label::new(&font, "Copied", FONT_SIZE),
@@ -229,6 +253,7 @@ fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
         qh,
         conn,
         events,
+        visible,
         pool: None,
         layer: None,
         pointer: None,
@@ -247,8 +272,9 @@ fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
         failed: 0.0,
         labelled: 0.0,
         grow: 0.0,
-        no_speech: false,
+        failure: Failure::Error,
         countdown: 0.0,
+        limit: RETRY_SECS,
         copied: None,
         hovered: false,
         button: None,
@@ -298,6 +324,8 @@ struct HudState {
     qh: QueueHandle<Self>,
     conn: Connection,
     events: UnboundedSender<Event>,
+    /// Tells the app whether the HUD is on screen.
+    visible: watch::Sender<bool>,
     pool: Option<SlotPool>,
     layer: Option<LayerSurface>,
     pointer: Option<(wl_pointer::WlPointer, Option<WpCursorShapeDeviceV1>)>,
@@ -325,10 +353,11 @@ struct HudState {
     labelled: f32,
     /// How far the pill has grown into the card, 0.0–1.0.
     grow: f32,
-    /// Whether the last failure was hearing no speech, which the label says.
-    no_speech: bool,
-    /// Seconds left before the retry button, or the card, goes away.
+    /// Why the pill last offered a retry.
+    failure: Failure,
+    /// Seconds left before the retry button, or the card, goes away, out of `limit`.
     countdown: f32,
+    limit: f32,
     /// When the copy button was clicked.
     copied: Option<Instant>,
     /// Whether the pointer is on the pill, which pauses the countdown, and
@@ -351,10 +380,12 @@ impl HudState {
         self.mode = mode;
         self.copied = None;
         match mode {
-            Mode::Failed => self.countdown = RETRY_SECS,
-            Mode::Offer => self.countdown = OFFER_SECS,
+            Mode::Failed if self.failure == Failure::Cancelled => self.limit = CANCELLED_SECS,
+            Mode::Failed => self.limit = RETRY_SECS,
+            Mode::Offer => self.limit = OFFER_SECS,
             Mode::Recording | Mode::Busy => {}
         }
+        self.countdown = self.limit;
         // From the card, a new pill pops up in its own surface.
         if was == Mode::Offer && mode != Mode::Offer {
             self.layer = None;
@@ -373,6 +404,12 @@ impl HudState {
             layer.commit();
         }
         self.update_input_region();
+        self.report_visible();
+    }
+
+    fn report_visible(&self) {
+        let shown = self.layer.is_some() && self.phase != Phase::Leaving;
+        self.visible.send_if_modified(|v| std::mem::replace(v, shown) != shown);
     }
 
     fn set_phase(&mut self, phase: Phase) {
@@ -409,7 +446,16 @@ impl HudState {
     }
 
     fn showing_label(&self) -> bool {
-        self.mode == Mode::Failed && self.no_speech
+        self.mode == Mode::Failed && self.failure_label().is_some()
+    }
+
+    /// What the pill says in place of the bars, for the last failure.
+    fn failure_label(&self) -> Option<&Label> {
+        match self.failure {
+            Failure::Error => None,
+            Failure::NoSpeech => Some(&self.labels.no_speech),
+            Failure::Cancelled => Some(&self.labels.cancelled),
+        }
     }
 
     /// For the pill, wide enough for its widest, at the peak of its entrance
@@ -418,7 +464,10 @@ impl HudState {
     fn surface_size(&self) -> (u32, u32) {
         match &self.card {
             Some(card) if self.mode == Mode::Offer => ((CARD_W + 2.0 * MARGIN).ceil() as u32, (card.height + 2.0 * MARGIN).ceil() as u32),
-            _ => ((pill_width(BARS_W.max(self.labels.no_speech.width), 1.0) * 1.1 + 4.0).ceil() as u32, SURFACE_H),
+            _ => {
+                let widest = BARS_W.max(self.labels.no_speech.width).max(self.labels.cancelled.width);
+                ((pill_width(widest, 1.0) * 1.1 + 4.0).ceil() as u32, SURFACE_H)
+            }
         }
     }
 
@@ -431,13 +480,14 @@ impl HudState {
         if self.layer.is_some() && self.phase != Phase::Leaving {
             self.set_phase(Phase::Leaving);
             self.update_input_region();
+            self.report_visible();
         }
     }
 
     /// Where the failed pill sits once settled, centered in the surface: its
     /// left edge, its width, and the middle of its retry button.
     fn failed_layout(&self) -> (f32, f32, (f32, f32)) {
-        let content = if self.no_speech { self.labels.no_speech.width } else { BARS_W };
+        let content = self.failure_label().map_or(BARS_W, |label| label.width);
         let pw = pill_width(content, 1.0);
         let left = (self.size.0 as f32 - pw) / 2.0;
         (left, pw, (left + pw - SLOT_INSET - SLOT / 2.0, self.size.1 as f32 - MARGIN - HEIGHT / 2.0))
@@ -575,14 +625,14 @@ impl HudState {
             failed: self.failed,
             labelled: self.labelled,
             grow: self.grow,
-            left: (self.countdown / if self.mode == Mode::Offer { OFFER_SECS } else { RETRY_SECS }).clamp(0.0, 1.0),
+            left: (self.countdown / self.limit).clamp(0.0, 1.0),
             hovered: self.button,
             copied: self.copied.is_some(),
         };
         if let Some(card) = self.card.as_ref().filter(|_| self.grow > 0.001) {
             paint_card(&mut pixmap, s as f32, &look, &self.labels, card, self.logo.as_ref());
         }
-        paint_pill(&mut pixmap, s as f32, &look, &self.labels.no_speech);
+        paint_pill(&mut pixmap, s as f32, &look, self.failure_label().unwrap_or(&self.labels.no_speech));
 
         let Some(layer) = &self.layer else { return };
         let pool = match &mut self.pool {
@@ -744,6 +794,7 @@ fn wrap(font: &FontRef, size: f32, text: &str, width: f32, max_lines: usize) -> 
 /// The pill's fixed texts.
 struct Labels {
     no_speech: Label,
+    cancelled: Label,
     hint: Label,
     copy: Label,
     copied: Label,
@@ -1117,6 +1168,7 @@ impl OutputHandler for HudState {
 impl LayerShellHandler for HudState {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
         self.layer = None;
+        self.report_visible();
     }
     fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, configure: LayerSurfaceConfigure, _: u32) {
         let (w, h) = configure.new_size;
