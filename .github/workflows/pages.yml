@@ -1,7 +1,12 @@
 # Publish site/ to GitHub Pages (https://srafis.github.io/fishpr/) whenever it
 # changes on main.
 #
-# One-time setup: Settings → Pages → Build and deployment → Source: GitHub Actions.
+# One-time setup, before the first run: Settings → Pages → Build and deployment
+# → Source: GitHub Actions. Or, as a repo admin:
+#
+#   gh api -X POST repos/srafis/fishpr/pages -f build_type=workflow
+#
+# Until then, configure-pages fails with "Get Pages site failed ... Not Found".
 
 name: Pages
 
@@ -27,13 +32,13 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
 
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
