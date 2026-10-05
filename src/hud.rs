@@ -1,8 +1,10 @@
 //! A black pill at the bottom of the screen, drawn as a wlr-layer-shell
 //! overlay (KWin supports it). While recording, its bars follow the mic; while
 //! transcribing, a spinner joins them; if that fails, a retry button takes the
-//! spinner's place for a few seconds. It never takes focus, and only the retry
-//! button takes clicks. Runs on its own thread with its own Wayland connection.
+//! spinner's place for a few seconds. When a transcription has nowhere to
+//! paste, the pill grows into a card that shows it with a copy button, for a
+//! few seconds. It never takes focus, and takes clicks only while it offers a
+//! retry or the card. Runs on its own thread with its own Wayland connection.
 
 use ab_glyph::{Font, FontRef, OutlineCurve, PxScale, ScaleFont};
 use smithay_client_toolkit::{
@@ -42,13 +44,14 @@ use std::{
     },
     time::Instant,
 };
-use tiny_skia::{Color, FillRule, LineCap, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{Color, FillRule, FilterQuality, IntSize, LineCap, Paint, Path, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::Event;
 
 const FONT: &[u8] = include_bytes!("../assets/NotoSans-Medium.ttf");
 const NO_SPEECH: &str = "No speech detected";
+const HINT: &str = "Select a text field first, then dictate";
 
 // Sizes are in logical pixels.
 const FONT_SIZE: f32 = 16.0;
@@ -85,10 +88,36 @@ const METER_RELEASE: f32 = 8.0;
 /// Linux's BTN_LEFT.
 const BUTTON_LEFT: u32 = 0x110;
 
+// The card that offers a transcription with nowhere to paste.
+const CARD_W: f32 = 400.0;
+const CARD_PAD: f32 = 18.0;
+const CARD_RADIUS: f32 = 24.0;
+const CARD_GAP: f32 = 12.0;
+/// The top row: logo, hint, and close button.
+const HEADER_H: f32 = 30.0;
+const LOGO: f32 = 24.0;
+const CLOSE: f32 = 28.0;
+const HINT_SIZE: f32 = 15.5;
+const BODY_SIZE: f32 = 17.0;
+const LINE_H: f32 = 25.0;
+/// Longer text is cut short with an ellipsis; the copy button copies all of it.
+const MAX_LINES: usize = 4;
+const COPY_H: f32 = 34.0;
+/// Room on either side of the copy button's label.
+const COPY_PAD: f32 = 16.0;
+/// The copy button's icon, and the space between it and the label.
+const COPY_ICON: f32 = 14.0;
+const COPY_ICON_GAP: f32 = 7.0;
+/// How long the card stays, not counting while the pointer is on it.
+const OFFER_SECS: f32 = 10.0;
+/// How long the copy button says "Copied" before the card goes.
+const COPIED_SECS: f32 = 0.7;
+
 enum Msg {
     Show,
     Busy,
     Fail { no_speech: bool },
+    Offer(String),
     Hide,
     Level(f32),
 }
@@ -138,6 +167,12 @@ impl Hud {
         let _ = self.tx.send(Msg::Fail { no_speech });
     }
 
+    /// Grows into a card that shows `text`, with a copy button, for a few
+    /// seconds. The button sends `Event::CopyLast`.
+    pub fn offer(&self, text: &str) {
+        let _ = self.tx.send(Msg::Offer(text.to_owned()));
+    }
+
     pub fn hide(&self) {
         let _ = self.tx.send(Msg::Hide);
     }
@@ -165,6 +200,10 @@ fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
                         state.no_speech = no_speech;
                         state.set_mode(Mode::Failed);
                     }
+                    Msg::Offer(text) => {
+                        state.card = Some(Card::new(&state.font, &text));
+                        state.set_mode(Mode::Offer);
+                    }
                     Msg::Hide => state.hide(),
                     Msg::Level(level) => state.target_level = level,
                 }
@@ -172,7 +211,13 @@ fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let label = Label::new(&FontRef::try_from_slice(FONT)?, NO_SPEECH);
+    let font = FontRef::try_from_slice(FONT)?;
+    let labels = Labels {
+        no_speech: Label::new(&font, NO_SPEECH, FONT_SIZE),
+        hint: Label::new(&font, HINT, HINT_SIZE),
+        copy: Label::new(&font, "Copy", FONT_SIZE),
+        copied: Label::new(&font, "Copied", FONT_SIZE),
+    };
     let mut state = HudState {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -188,6 +233,7 @@ fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
         layer: None,
         pointer: None,
         scale: 1,
+        size: (0, 0),
         mode: Mode::Recording,
         phase: Phase::Shown,
         since: Instant::now(),
@@ -200,12 +246,17 @@ fn run(rx: Channel<Msg>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
         busy: 0.0,
         failed: 0.0,
         labelled: 0.0,
+        grow: 0.0,
         no_speech: false,
         countdown: 0.0,
+        copied: None,
         hovered: false,
-        on_button: false,
+        button: None,
         enter_serial: 0,
-        label,
+        font,
+        labels,
+        card: None,
+        logo: None,
     };
     loop {
         event_loop.dispatch(None, &mut state)?;
@@ -217,6 +268,15 @@ enum Mode {
     Recording,
     Busy,
     Failed,
+    Offer,
+}
+
+/// What the pointer can click.
+#[derive(Clone, Copy, PartialEq)]
+enum Button {
+    Retry,
+    Close,
+    Copy,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -242,6 +302,8 @@ struct HudState {
     layer: Option<LayerSurface>,
     pointer: Option<(wl_pointer::WlPointer, Option<WpCursorShapeDeviceV1>)>,
     scale: i32,
+    /// The surface's size, as the compositor last configured it.
+    size: (u32, u32),
     mode: Mode,
     phase: Phase,
     /// When the current phase began.
@@ -261,29 +323,54 @@ struct HudState {
     failed: f32,
     /// How much the label shows in place of the bars, 0.0–1.0.
     labelled: f32,
+    /// How far the pill has grown into the card, 0.0–1.0.
+    grow: f32,
     /// Whether the last failure was hearing no speech, which the label says.
     no_speech: bool,
-    /// Seconds left before the retry button goes away.
+    /// Seconds left before the retry button, or the card, goes away.
     countdown: f32,
+    /// When the copy button was clicked.
+    copied: Option<Instant>,
     /// Whether the pointer is on the pill, which pauses the countdown, and
-    /// whether it's on the retry button.
+    /// which button it's on.
     hovered: bool,
-    on_button: bool,
+    button: Option<Button>,
     /// The pointer's latest entry onto the pill, which changing the cursor needs.
     enter_serial: u32,
-    label: Label,
+    font: FontRef<'static>,
+    labels: Labels,
+    /// The transcription the card offers.
+    card: Option<Card>,
+    /// The app icon for the card, at the surface's scale.
+    logo: Option<Pixmap>,
 }
 
 impl HudState {
     fn set_mode(&mut self, mode: Mode) {
+        let was = self.mode;
         self.mode = mode;
-        if mode == Mode::Failed {
-            self.countdown = RETRY_SECS;
+        self.copied = None;
+        match mode {
+            Mode::Failed => self.countdown = RETRY_SECS,
+            Mode::Offer => self.countdown = OFFER_SECS,
+            Mode::Recording | Mode::Busy => {}
+        }
+        // From the card, a new pill pops up in its own surface.
+        if was == Mode::Offer && mode != Mode::Offer {
+            self.layer = None;
         }
         match (&self.layer, self.phase) {
             (None, _) => self.create_layer(),
             (Some(_), Phase::Leaving) => self.set_phase(Phase::Entering),
             (Some(_), _) => {}
+        }
+        // The pill grows into the card once the surface has room for it.
+        if mode == Mode::Offer
+            && let Some(layer) = &self.layer
+        {
+            let (w, h) = self.surface_size();
+            layer.set_size(w, h);
+            layer.commit();
         }
         self.update_input_region();
     }
@@ -300,18 +387,21 @@ impl HudState {
         layer.set_margin(0, 0, BOTTOM_MARGIN - MARGIN as i32, 0);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_exclusive_zone(-1);
-        layer.set_size(self.surface_width(), SURFACE_H);
+        let (w, h) = self.surface_size();
+        layer.set_size(w, h);
+        self.size = (0, 0);
         self.set_phase(Phase::Entering);
         self.started = self.since;
         self.last_frame = self.since;
         self.frame_pending = false;
-        (self.hovered, self.on_button) = (false, false);
+        (self.hovered, self.button) = (false, None);
         (self.level, self.target_level) = (0.0, 0.0);
         // Appear already in shape, rather than morphing while popping in.
         self.open = if self.mode == Mode::Recording { 0.0 } else { 1.0 };
         self.busy = if self.mode == Mode::Busy { 1.0 } else { 0.0 };
         self.failed = if self.mode == Mode::Failed { 1.0 } else { 0.0 };
         self.labelled = if self.showing_label() { 1.0 } else { 0.0 };
+        self.grow = if self.mode == Mode::Offer { 1.0 } else { 0.0 };
         // First commit has no buffer; we draw once the compositor configures us.
         layer.commit();
         self.layer = Some(layer);
@@ -322,9 +412,19 @@ impl HudState {
         self.mode == Mode::Failed && self.no_speech
     }
 
-    /// Wide enough for the widest pill, at the peak of its entrance bounce.
-    fn surface_width(&self) -> u32 {
-        (pill_width(BARS_W.max(self.label.width), 1.0) * 1.1 + 4.0).ceil() as u32
+    /// For the pill, wide enough for its widest, at the peak of its entrance
+    /// bounce. The card's surface is taller, and the card's bottom edge sits
+    /// where the pill's does.
+    fn surface_size(&self) -> (u32, u32) {
+        match &self.card {
+            Some(card) if self.mode == Mode::Offer => ((CARD_W + 2.0 * MARGIN).ceil() as u32, (card.height + 2.0 * MARGIN).ceil() as u32),
+            _ => ((pill_width(BARS_W.max(self.labels.no_speech.width), 1.0) * 1.1 + 4.0).ceil() as u32, SURFACE_H),
+        }
+    }
+
+    /// The card's top-left corner on the surface, once grown.
+    fn card_origin(&self, card: &Card) -> (f32, f32) {
+        ((self.size.0 as f32 - CARD_W) / 2.0, self.size.1 as f32 - MARGIN - card.height)
     }
 
     fn hide(&mut self) {
@@ -337,38 +437,70 @@ impl HudState {
     /// Where the failed pill sits once settled, centered in the surface: its
     /// left edge, its width, and the middle of its retry button.
     fn failed_layout(&self) -> (f32, f32, (f32, f32)) {
-        let content = if self.no_speech { self.label.width } else { BARS_W };
+        let content = if self.no_speech { self.labels.no_speech.width } else { BARS_W };
         let pw = pill_width(content, 1.0);
-        let left = (self.surface_width() as f32 - pw) / 2.0;
-        (left, pw, (left + pw - SLOT_INSET - SLOT / 2.0, SURFACE_H as f32 / 2.0))
+        let left = (self.size.0 as f32 - pw) / 2.0;
+        (left, pw, (left + pw - SLOT_INSET - SLOT / 2.0, self.size.1 as f32 - MARGIN - HEIGHT / 2.0))
     }
 
-    /// Clicks go through the HUD, except while it offers a retry: then the
-    /// pill takes the pointer, so resting on it pauses the countdown.
+    /// Clicks go through the HUD, except while it offers a retry or the card:
+    /// then the pill or card takes the pointer, so resting on it pauses the
+    /// countdown.
     fn update_input_region(&mut self) {
         let Some(layer) = &self.layer else { return };
         let Ok(region) = Region::new(&self.compositor) else { return };
-        if self.mode == Mode::Failed && self.phase != Phase::Leaving {
-            let (left, pw, _) = self.failed_layout();
-            let top = (SURFACE_H as f32 - HEIGHT) / 2.0;
-            region.add(left as i32, top as i32, pw.ceil() as i32, HEIGHT as i32);
-        } else {
-            (self.hovered, self.on_button) = (false, false);
+        match (self.mode, &self.card) {
+            _ if self.phase == Phase::Leaving => (self.hovered, self.button) = (false, None),
+            (Mode::Failed, _) => {
+                let (left, pw, _) = self.failed_layout();
+                let top = self.size.1 as f32 - MARGIN - HEIGHT;
+                region.add(left as i32, top as i32, pw.ceil() as i32, HEIGHT as i32);
+            }
+            (Mode::Offer, Some(card)) => {
+                let (left, top) = self.card_origin(card);
+                region.add(left as i32, top as i32, CARD_W.ceil() as i32, card.height.ceil() as i32);
+            }
+            _ => (self.hovered, self.button) = (false, None),
         }
         layer.wl_surface().set_input_region(Some(region.wl_region()));
     }
 
-    /// Tracks whether the pointer, at `(x, y)` on the surface, is on the
-    /// retry button, and shows a hand there.
+    /// Tracks which button the pointer, at `(x, y)` on the surface, is on,
+    /// and shows a hand there.
     fn point_at(&mut self, (x, y): (f64, f64)) {
-        let (_, _, (bx, by)) = self.failed_layout();
-        let on_button = (x as f32 - bx).hypot(y as f32 - by) <= SLOT / 2.0 + 1.0;
-        if on_button != self.on_button || !self.hovered {
+        let (x, y) = (x as f32, y as f32);
+        let button = match (self.mode, &self.card) {
+            (Mode::Failed, _) => {
+                let (_, _, (bx, by)) = self.failed_layout();
+                ((x - bx).hypot(y - by) <= SLOT / 2.0 + 1.0).then_some(Button::Retry)
+            }
+            (Mode::Offer, Some(card)) => {
+                let (left, top) = self.card_origin(card);
+                card.button_at(x - left, y - top, &self.labels)
+            }
+            _ => None,
+        };
+        if button.is_some() != self.button.is_some() || !self.hovered {
             if let Some((_, Some(shape))) = &self.pointer {
-                shape.set_shape(self.enter_serial, if on_button { Shape::Pointer } else { Shape::Default });
+                shape.set_shape(self.enter_serial, if button.is_some() { Shape::Pointer } else { Shape::Default });
             }
         }
-        (self.hovered, self.on_button) = (true, on_button);
+        (self.hovered, self.button) = (true, button);
+    }
+
+    fn click(&mut self) {
+        match (self.mode, self.button) {
+            (Mode::Failed, Some(Button::Retry)) => {
+                let _ = self.events.send(Event::Retry);
+                self.set_mode(Mode::Busy);
+            }
+            (Mode::Offer, Some(Button::Close)) => self.hide(),
+            (Mode::Offer, Some(Button::Copy)) if self.copied.is_none() => {
+                let _ = self.events.send(Event::CopyLast);
+                self.copied = Some(Instant::now());
+            }
+            _ => {}
+        }
     }
 
     fn draw(&mut self) {
@@ -404,11 +536,14 @@ impl HudState {
             }
         };
 
-        if self.mode == Mode::Failed && self.phase != Phase::Leaving && !self.hovered {
+        if matches!(self.mode, Mode::Failed | Mode::Offer) && self.phase != Phase::Leaving && !self.hovered {
             self.countdown -= dt;
             if self.countdown <= 0.0 {
                 self.hide();
             }
+        }
+        if self.mode == Mode::Offer && self.phase != Phase::Leaving && self.copied.is_some_and(|at| at.elapsed().as_secs_f32() >= COPIED_SECS) {
+            self.hide();
         }
         // Once recording stops, the bars settle back to dots.
         let target_level = if self.mode == Mode::Recording { self.target_level } else { 0.0 };
@@ -419,10 +554,17 @@ impl HudState {
         self.busy += (f32::from(self.mode == Mode::Busy) - self.busy) * morph;
         self.failed += (f32::from(self.mode == Mode::Failed) - self.failed) * morph;
         self.labelled += (f32::from(self.showing_label()) - self.labelled) * morph;
+        // Taller than the pill's surface once the compositor has resized it.
+        let grown = self.mode == Mode::Offer && self.size.1 > SURFACE_H;
+        self.grow += (f32::from(grown) - self.grow) * morph;
 
-        let (w, h) = (self.surface_width(), SURFACE_H);
+        let (w, h) = self.size;
         let s = self.scale.max(1) as u32;
         let Some(mut pixmap) = Pixmap::new(w * s, h * s) else { return };
+        let logo_px = (LOGO * s as f32).round() as u32;
+        if self.card.is_some() && self.logo.as_ref().is_none_or(|l| l.width() != logo_px) {
+            self.logo = logo(logo_px);
+        }
         let look = Look {
             time,
             zoom,
@@ -432,10 +574,15 @@ impl HudState {
             busy: self.busy,
             failed: self.failed,
             labelled: self.labelled,
-            left: (self.countdown / RETRY_SECS).clamp(0.0, 1.0),
-            hovered: self.on_button,
+            grow: self.grow,
+            left: (self.countdown / if self.mode == Mode::Offer { OFFER_SECS } else { RETRY_SECS }).clamp(0.0, 1.0),
+            hovered: self.button,
+            copied: self.copied.is_some(),
         };
-        paint_pill(&mut pixmap, s as f32, &look, &self.label);
+        if let Some(card) = self.card.as_ref().filter(|_| self.grow > 0.001) {
+            paint_card(&mut pixmap, s as f32, &look, &self.labels, card, self.logo.as_ref());
+        }
+        paint_pill(&mut pixmap, s as f32, &look, &self.labels.no_speech);
 
         let Some(layer) = &self.layer else { return };
         let pool = match &mut self.pool {
@@ -486,8 +633,8 @@ struct Label {
 }
 
 impl Label {
-    fn new(font: &FontRef, text: &str) -> Self {
-        let scaled = font.as_scaled(PxScale::from(FONT_SIZE));
+    fn new(font: &FontRef, text: &str, size: f32) -> Self {
+        let scaled = font.as_scaled(PxScale::from(size));
         let (sx, sy) = (scaled.h_scale_factor(), scaled.v_scale_factor());
         let mut pb = PathBuilder::new();
         let mut caret = 0.0;
@@ -537,6 +684,127 @@ impl Label {
     }
 }
 
+/// How wide `text` is, set in `font` at `size`.
+fn text_width(font: &FontRef, size: f32, text: &str) -> f32 {
+    let scaled = font.as_scaled(PxScale::from(size));
+    let mut prev = None;
+    let mut width = 0.0;
+    for c in text.chars() {
+        let id = font.glyph_id(c);
+        if let Some(prev) = prev {
+            width += scaled.kern(prev, id);
+        }
+        prev = Some(id);
+        width += scaled.h_advance(id);
+    }
+    width
+}
+
+/// Breaks `text` into lines no wider than `width`, between words where it
+/// can. Past `max_lines`, the last line ends in an ellipsis.
+fn wrap(font: &FontRef, size: f32, text: &str, width: f32, max_lines: usize) -> Vec<String> {
+    let fits = |line: &str| text_width(font, size, line) <= width;
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if lines.len() > max_lines {
+            break;
+        }
+        let joined = if line.is_empty() { word.to_owned() } else { format!("{line} {word}") };
+        if fits(&joined) {
+            line = joined;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        // A word too long for a line of its own breaks where it overflows.
+        for c in word.chars() {
+            line.push(c);
+            if !fits(&line) && line.chars().count() > 1 {
+                line.pop();
+                lines.push(std::mem::replace(&mut line, c.to_string()));
+            }
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        let last = lines.last_mut().expect("max_lines is positive");
+        while !last.is_empty() && !fits(&format!("{}…", last.trim_end())) {
+            last.pop();
+        }
+        *last = format!("{}…", last.trim_end());
+    }
+    lines
+}
+
+/// The pill's fixed texts.
+struct Labels {
+    no_speech: Label,
+    hint: Label,
+    copy: Label,
+    copied: Label,
+}
+
+impl Labels {
+    fn copy_width(&self) -> f32 {
+        COPY_ICON + COPY_ICON_GAP + self.copy.width.max(self.copied.width) + 2.0 * COPY_PAD
+    }
+}
+
+/// A transcription on offer, laid out on the card. Card coordinates have the
+/// card's top-left corner at (0, 0).
+struct Card {
+    lines: Vec<Label>,
+    height: f32,
+}
+
+impl Card {
+    fn new(font: &FontRef, text: &str) -> Self {
+        let lines: Vec<Label> =
+            wrap(font, BODY_SIZE, text, CARD_W - 2.0 * CARD_PAD, MAX_LINES).iter().map(|line| Label::new(font, line, BODY_SIZE)).collect();
+        let height = CARD_PAD + HEADER_H + CARD_GAP + LINE_H * lines.len().max(1) as f32 + CARD_GAP + COPY_H + CARD_PAD;
+        Self { lines, height }
+    }
+
+    fn close_center() -> (f32, f32) {
+        (CARD_W - CARD_PAD - CLOSE / 2.0, CARD_PAD + HEADER_H / 2.0)
+    }
+
+    /// The copy button's left edge, top edge, and width.
+    fn copy_rect(&self, labels: &Labels) -> (f32, f32, f32) {
+        let w = labels.copy_width();
+        (CARD_W - CARD_PAD - w, self.height - CARD_PAD - COPY_H, w)
+    }
+
+    fn button_at(&self, x: f32, y: f32, labels: &Labels) -> Option<Button> {
+        let (cx, cy) = Self::close_center();
+        let (bx, by, bw) = self.copy_rect(labels);
+        if (x - cx).hypot(y - cy) <= CLOSE / 2.0 + 1.0 {
+            Some(Button::Close)
+        } else if (bx..=bx + bw).contains(&x) && (by..=by + COPY_H).contains(&y) {
+            Some(Button::Copy)
+        } else {
+            None
+        }
+    }
+}
+
+/// The app icon, `px` device pixels across, premultiplied for tiny-skia.
+fn logo(px: u32) -> Option<Pixmap> {
+    let mut data = crate::icon(px).into_raw();
+    for p in data.chunks_exact_mut(4) {
+        let a = u16::from(p[3]);
+        for c in &mut p[..3] {
+            *c = (u16::from(*c) * a / 255) as u8;
+        }
+    }
+    Pixmap::from_vec(data, IntSize::from_wh(px, px)?)
+}
+
 /// One frame of the pill's animation. The mixes run from 0.0 to 1.0.
 struct Look {
     /// Seconds since the pill appeared, for the looping animations.
@@ -552,36 +820,42 @@ struct Look {
     failed: f32,
     /// How much the label shows in place of the bars.
     labelled: f32,
-    /// How much of the retry window is left.
+    /// How far the pill has grown into the card.
+    grow: f32,
+    /// How much of the retry window, or the card's time, is left.
     left: f32,
-    /// Whether the pointer is on the retry button.
-    hovered: bool,
+    /// The button the pointer is on.
+    hovered: Option<Button>,
+    /// Whether the card's text has been copied.
+    copied: bool,
 }
 
-/// Paints the pill, centered in `pixmap`, at `scale` device pixels per logical pixel.
+/// Paints the pill, centered at the bottom of `pixmap`, at `scale` device
+/// pixels per logical pixel. As it grows into the card, the card draws its
+/// shape and the pill's contents fade.
 fn paint_pill(pixmap: &mut Pixmap, scale: f32, look: &Look, label: &Label) {
-    let Look { time, zoom, drop, level, open, busy, failed, labelled, left, hovered } = *look;
+    let Look { time, zoom, drop, level, open, busy, failed, labelled, grow, left, hovered, .. } = *look;
+    let fade = (1.0 - 4.0 * grow).clamp(0.0, 1.0);
+    if fade < 0.01 {
+        return;
+    }
     let pw = pill_width(BARS_W + (label.width - BARS_W) * labelled, open);
     let cy = HEIGHT / 2.0;
     // Pill coordinates: the pill's top-left corner is (0, 0).
     let t = Transform::from_scale(scale, scale)
-        .pre_translate(pixmap.width() as f32 / scale / 2.0, pixmap.height() as f32 / scale / 2.0 + drop)
+        .pre_translate(pixmap.width() as f32 / scale / 2.0, pixmap.height() as f32 / scale - MARGIN - cy + drop)
         .pre_scale(zoom, zoom)
         .pre_translate(-pw / 2.0, -cy);
 
-    if let Some(pill) = rounded_rect(pw, HEIGHT, HEIGHT / 2.0) {
-        pixmap.fill_path(&pill, &paint(10, 10, 10, 0.94), FillRule::Winding, t, None);
-    }
-    // A thin dark rim keeps the pill's edge visible over black windows.
-    if let Some(rim) = rounded_rect(pw - 1.0, HEIGHT - 1.0, (HEIGHT - 1.0) / 2.0) {
-        pixmap.stroke_path(&rim, &paint(48, 48, 47, 1.0), &Stroke { width: 1.0, ..Default::default() }, t.pre_translate(0.5, 0.5), None);
+    if grow < 0.001 {
+        paint_shape(pixmap, pw, HEIGHT, HEIGHT / 2.0, 0.94, t);
     }
 
     // Level bars, tallest in the middle. Their height follows the mic, and
     // each wobbles a little so speech looks alive; in silence they rest as
     // dots. While transcribing, a ripple runs along them; on failure they
     // turn red.
-    let bars = 1.0 - labelled;
+    let bars = (1.0 - labelled) * fade;
     if bars > 0.01 {
         let mid = (BARS - 1) as f32 / 2.0;
         let (r, g, b) = mix((255, 255, 255), (255, 92, 92), failed);
@@ -600,14 +874,14 @@ fn paint_pill(pixmap: &mut Pixmap, scale: f32, look: &Look, label: &Label) {
         }
     }
     if let Some(text) = label.path.as_ref().filter(|_| labelled > 0.01) {
-        pixmap.fill_path(text, &paint(255, 255, 255, 0.92 * labelled), FillRule::Winding, t.pre_translate(PAD, cy + label.middle), None);
+        pixmap.fill_path(text, &paint(255, 255, 255, 0.92 * labelled * fade), FillRule::Winding, t.pre_translate(PAD, cy + label.middle), None);
     }
 
     let (sx, sy) = (pw - SLOT_INSET - SLOT / 2.0, cy);
     let round = |width| Stroke { width, line_cap: LineCap::Round, ..Default::default() };
 
     // Spinner: a short arc running around a faint track.
-    let a = busy * open;
+    let a = busy * open * fade;
     if a > 0.01 {
         if let Some(track) = PathBuilder::from_circle(sx, sy, 6.0) {
             pixmap.stroke_path(&track, &paint(255, 255, 255, 0.18 * a), &round(1.9), t, None);
@@ -618,10 +892,10 @@ fn paint_pill(pixmap: &mut Pixmap, scale: f32, look: &Look, label: &Label) {
     }
 
     // Retry button, ringed by the time left to press it.
-    let a = failed * open;
+    let a = failed * open * fade;
     if a > 0.01 {
         if let Some(button) = PathBuilder::from_circle(sx, sy, SLOT / 2.0) {
-            let fill = if hovered { 0.24 } else { 0.12 };
+            let fill = if hovered == Some(Button::Retry) { 0.24 } else { 0.12 };
             pixmap.fill_path(&button, &paint(255, 255, 255, fill * a), FillRule::Winding, t, None);
         }
         if let Some(ring) = arc(sx, sy, SLOT / 2.0 - 0.95, -FRAC_PI_2, TAU * left) {
@@ -645,6 +919,124 @@ fn paint_pill(pixmap: &mut Pixmap, scale: f32, look: &Look, label: &Label) {
             pixmap.fill_path(&head, &paint(255, 255, 255, a), FillRule::Winding, t, None);
         }
     }
+}
+
+/// The pill's or card's black body, `w` by `h` with corners of radius `r`.
+/// `opacity` lets a little of what's behind show through.
+fn paint_shape(pixmap: &mut Pixmap, w: f32, h: f32, r: f32, opacity: f32, t: Transform) {
+    if let Some(body) = rounded_rect(w, h, r) {
+        pixmap.fill_path(&body, &paint(10, 10, 10, opacity), FillRule::Winding, t, None);
+    }
+    // A thin dark rim keeps the edge visible over black windows.
+    if let Some(rim) = rounded_rect(w - 1.0, h - 1.0, r - 0.5) {
+        pixmap.stroke_path(&rim, &paint(48, 48, 47, 1.0), &Stroke { width: 1.0, ..Default::default() }, t.pre_translate(0.5, 0.5), None);
+    }
+}
+
+/// Paints the card, its bottom edge where the pill's is, grown `look.grow`
+/// of the way from the pill. Its contents fade in once it's nearly there.
+fn paint_card(pixmap: &mut Pixmap, scale: f32, look: &Look, labels: &Labels, card: &Card, logo: Option<&Pixmap>) {
+    let Look { zoom, drop, open, labelled, grow, left, hovered, copied, .. } = *look;
+    let g = grow * grow * (3.0 - 2.0 * grow);
+    let lerp = |a: f32, b: f32| a + (b - a) * g;
+    let pw = pill_width(BARS_W + (labels.no_speech.width - BARS_W) * labelled, open);
+    let (w, h) = (lerp(pw, CARD_W), lerp(HEIGHT, card.height));
+    let t = Transform::from_scale(scale, scale)
+        .pre_translate(pixmap.width() as f32 / scale / 2.0, pixmap.height() as f32 / scale - MARGIN - h / 2.0 + drop)
+        .pre_scale(zoom, zoom)
+        .pre_translate(-w / 2.0, -h / 2.0);
+    // Opaque once grown, so what's behind doesn't show through the text.
+    paint_shape(pixmap, w, h, lerp(HEIGHT / 2.0, CARD_RADIUS), lerp(0.94, 1.0), t);
+
+    let a = ((grow - 0.6) / 0.4).clamp(0.0, 1.0);
+    if a < 0.01 {
+        return;
+    }
+    let round = |width| Stroke { width, line_cap: LineCap::Round, ..Default::default() };
+    if let Some(logo) = logo {
+        let k = LOGO / logo.width() as f32 * scale;
+        let paint = PixmapPaint { opacity: a, quality: FilterQuality::Bicubic, ..Default::default() };
+        pixmap.draw_pixmap(0, 0, logo.as_ref(), &paint, t.pre_translate(CARD_PAD, CARD_PAD + (HEADER_H - LOGO) / 2.0).pre_scale(k / scale, k / scale), None);
+    }
+    let (cx, cy) = Card::close_center();
+    if let Some(hint) = &labels.hint.path {
+        let x = cx - CLOSE / 2.0 - 10.0 - labels.hint.width;
+        pixmap.fill_path(hint, &paint(255, 255, 255, 0.5 * a), FillRule::Winding, t.pre_translate(x, cy + labels.hint.middle), None);
+    }
+
+    // Close button, ringed by the time left before the card goes.
+    if let Some(button) = PathBuilder::from_circle(cx, cy, CLOSE / 2.0) {
+        let fill = if hovered == Some(Button::Close) { 0.16 } else { 0.06 };
+        pixmap.fill_path(&button, &paint(255, 255, 255, fill * a), FillRule::Winding, t, None);
+    }
+    if let Some(track) = PathBuilder::from_circle(cx, cy, CLOSE / 2.0 - 0.9) {
+        pixmap.stroke_path(&track, &paint(255, 255, 255, 0.2 * a), &round(1.6), t, None);
+    }
+    if let Some(ring) = arc(cx, cy, CLOSE / 2.0 - 0.9, -FRAC_PI_2, TAU * left) {
+        pixmap.stroke_path(&ring, &paint(255, 255, 255, 0.85 * a), &round(1.6), t, None);
+    }
+    let mut cross = PathBuilder::new();
+    let arm = 4.25;
+    cross.move_to(cx - arm, cy - arm);
+    cross.line_to(cx + arm, cy + arm);
+    cross.move_to(cx + arm, cy - arm);
+    cross.line_to(cx - arm, cy + arm);
+    if let Some(cross) = cross.finish() {
+        pixmap.stroke_path(&cross, &paint(255, 255, 255, a), &round(1.7), t, None);
+    }
+
+    for (i, line) in card.lines.iter().enumerate() {
+        if let Some(path) = &line.path {
+            let y = CARD_PAD + HEADER_H + CARD_GAP + LINE_H * (i as f32 + 0.5) + line.middle;
+            pixmap.fill_path(path, &paint(255, 255, 255, 0.88 * a), FillRule::Winding, t.pre_translate(CARD_PAD, y), None);
+        }
+    }
+
+    let (bx, by, bw) = card.copy_rect(labels);
+    if let Some(button) = rounded_rect(bw, COPY_H, 10.0) {
+        let fill = if hovered == Some(Button::Copy) && !copied { 0.5 } else { 0.4 };
+        pixmap.fill_path(&button, &paint(255, 255, 255, fill * a), FillRule::Winding, t.pre_translate(bx, by), None);
+    }
+    // The icon and label, centered together: two overlapping pages, or a
+    // check once copied.
+    let label = if copied { &labels.copied } else { &labels.copy };
+    let left = bx + (bw - COPY_ICON - COPY_ICON_GAP - label.width) / 2.0;
+    if let Some(icon) = if copied { check_icon() } else { copy_icon() } {
+        let at = t.pre_translate(left, by + (COPY_H - COPY_ICON) / 2.0);
+        pixmap.stroke_path(&icon, &paint(255, 255, 255, a), &round(1.5), at, None);
+    }
+    if let Some(path) = &label.path {
+        let at = t.pre_translate(left + COPY_ICON + COPY_ICON_GAP, by + COPY_H / 2.0 + label.middle);
+        pixmap.fill_path(path, &paint(255, 255, 255, a), FillRule::Winding, at, None);
+    }
+}
+
+/// Two overlapping pages, COPY_ICON square: the front one whole, the back
+/// one only where it shows above and left of it.
+fn copy_icon() -> Option<Path> {
+    let (s, r) = (COPY_ICON * 0.7, 2.0);
+    let o = COPY_ICON - s;
+    let mut pb = PathBuilder::new();
+    pb.move_to(o, s);
+    pb.line_to(r, s);
+    pb.quad_to(0.0, s, 0.0, s - r);
+    pb.line_to(0.0, r);
+    pb.quad_to(0.0, 0.0, r, 0.0);
+    pb.line_to(s - r, 0.0);
+    pb.quad_to(s, 0.0, s, r);
+    pb.line_to(s, o);
+    pb.push_path(&rounded_rect(s, s, r)?.transform(Transform::from_translate(o, o))?);
+    pb.finish()
+}
+
+/// A check mark, COPY_ICON square.
+fn check_icon() -> Option<Path> {
+    let k = COPY_ICON / 14.0;
+    let mut pb = PathBuilder::new();
+    pb.move_to(1.5 * k, 7.5 * k);
+    pb.line_to(5.5 * k, 11.5 * k);
+    pb.line_to(12.5 * k, 3.0 * k);
+    pb.finish()
 }
 
 /// Eases from 0.0 to 1.0 over `p` in 0.0–1.0, overshooting once and settling,
@@ -726,7 +1118,10 @@ impl LayerShellHandler for HudState {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
         self.layer = None;
     }
-    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, _: LayerSurfaceConfigure, _: u32) {
+    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, configure: LayerSurfaceConfigure, _: u32) {
+        let (w, h) = configure.new_size;
+        self.size = if w > 0 && h > 0 { (w, h) } else { self.surface_size() };
+        self.update_input_region();
         self.draw();
     }
 }
@@ -758,7 +1153,7 @@ impl SeatHandler for HudState {
 }
 
 impl PointerHandler for HudState {
-    // The pill only takes the pointer while it offers a retry.
+    // The pill only takes the pointer while it offers a retry or the card.
     fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         for event in events {
             if self.layer.as_ref().is_none_or(|layer| layer.wl_surface() != &event.surface) {
@@ -771,11 +1166,8 @@ impl PointerHandler for HudState {
                     self.point_at(event.position);
                 }
                 PointerEventKind::Motion { .. } => self.point_at(event.position),
-                PointerEventKind::Leave { .. } => (self.hovered, self.on_button) = (false, false),
-                PointerEventKind::Press { button: BUTTON_LEFT, .. } if self.on_button && self.mode == Mode::Failed && self.phase != Phase::Leaving => {
-                    let _ = self.events.send(Event::Retry);
-                    self.set_mode(Mode::Busy);
-                }
+                PointerEventKind::Leave { .. } => (self.hovered, self.button) = (false, None),
+                PointerEventKind::Press { button: BUTTON_LEFT, .. } if self.phase != Phase::Leaving => self.click(),
                 _ => {}
             }
         }
@@ -798,3 +1190,36 @@ impl ProvidesRegistryState for HudState {
 }
 
 smithay_client_toolkit::delegate_dispatch2!(HudState);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn font() -> FontRef<'static> {
+        FontRef::try_from_slice(FONT).unwrap()
+    }
+
+    #[test]
+    fn wraps_between_words() {
+        let lines = wrap(&font(), BODY_SIZE, "one two three four five six", text_width(&font(), BODY_SIZE, "one two three"), 4);
+        assert_eq!(lines, ["one two three", "four five six"]);
+    }
+
+    #[test]
+    fn cuts_long_text_short_with_an_ellipsis() {
+        let font = font();
+        let lines = wrap(&font, BODY_SIZE, &"word ".repeat(200), 200.0, MAX_LINES);
+        assert_eq!(lines.len(), MAX_LINES);
+        assert!(lines[MAX_LINES - 1].ends_with('…'));
+        assert!(lines.iter().all(|l| text_width(&font, BODY_SIZE, l) <= 200.0));
+    }
+
+    #[test]
+    fn breaks_a_word_too_long_for_a_line() {
+        let font = font();
+        let lines = wrap(&font, BODY_SIZE, &"x".repeat(100), 100.0, MAX_LINES);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|l| text_width(&font, BODY_SIZE, l) <= 100.0));
+    }
+}
+

@@ -1,8 +1,9 @@
 //! Global push-to-talk shortcut via KDE's KGlobalAccel (built into KWin).
 //!
 //! KGlobalAccel reports both press and release, which is what hold-to-talk
-//! needs. Ctrl+Space is registered as the *default*, so users can rebind it in
-//! System Settings → Shortcuts → fishpr and the choice sticks.
+//! needs. Ctrl+Space, and Ctrl+Alt+V to paste the last transcription again,
+//! are registered as *defaults*, so users can rebind them in System Settings →
+//! Shortcuts → fishpr and the choice sticks.
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -12,10 +13,19 @@ use zbus::zvariant::OwnedObjectPath;
 use crate::Event;
 
 const COMPONENT: &str = "fishpr";
-const ACTION: &str = "push-to-talk";
+const PUSH_TO_TALK: &str = "push-to-talk";
+const PASTE_LAST: &str = "paste-last";
 
-// Qt key codes: Qt::ControlModifier | Qt::Key_Space.
+// Qt key codes: Qt::ControlModifier | Qt::Key_Space, and
+// Qt::ControlModifier | Qt::AltModifier | Qt::Key_V.
 const CTRL_SPACE: i32 = 0x0400_0000 | 0x20;
+const CTRL_ALT_V: i32 = 0x0400_0000 | 0x0800_0000 | 0x56;
+
+/// Each action's ID (component, action, and their display names) and default keys.
+const ACTIONS: [([&str; 4], i32); 2] = [
+    ([COMPONENT, PUSH_TO_TALK, "fishpr", "Push to talk (hold)"], CTRL_SPACE),
+    ([COMPONENT, PASTE_LAST, "fishpr", "Paste last transcription"], CTRL_ALT_V),
+];
 
 // kglobalacceld's SetShortcutFlag values.
 const SET_PRESENT: u32 = 2;
@@ -46,14 +56,10 @@ trait Component {
     fn global_shortcut_released(&self, component_unique: String, shortcut_unique: String, timestamp: i64) -> zbus::Result<()>;
 }
 
-/// Keeps the shortcut registered; call `unregister` before exiting so KWin
+/// Keeps the shortcuts registered; call `unregister` before exiting so KWin
 /// stops grabbing the keys while fishpr isn't running.
 pub struct Shortcut {
     accel: KGlobalAccelProxy<'static>,
-}
-
-fn action_id() -> [&'static str; 4] {
-    [COMPONENT, ACTION, "fishpr", "Push to talk (hold)"]
 }
 
 impl Shortcut {
@@ -63,10 +69,11 @@ impl Shortcut {
             bail!("this isn't KDE Plasma, which fishpr's shortcut needs");
         }
         let accel = KGlobalAccelProxy::new(&conn).await.context("connecting to KGlobalAccel")?;
-        let id = action_id();
-        accel.do_register(&id).await?;
-        accel.set_shortcut_keys(&id, &[(vec![CTRL_SPACE],)], IS_DEFAULT).await?;
-        accel.set_shortcut_keys(&id, &[(vec![CTRL_SPACE],)], SET_PRESENT).await?;
+        for (id, key) in ACTIONS {
+            accel.do_register(&id).await?;
+            accel.set_shortcut_keys(&id, &[(vec![key],)], IS_DEFAULT).await?;
+            accel.set_shortcut_keys(&id, &[(vec![key],)], SET_PRESENT).await?;
+        }
 
         let path = accel.get_component(COMPONENT).await?;
         let component = ComponentProxy::builder(&conn).path(path)?.build().await?;
@@ -74,12 +81,19 @@ impl Shortcut {
         let mut released = component.receive_global_shortcut_released().await?;
         tokio::spawn(async move {
             loop {
-                let (signal, event) = tokio::select! {
-                    Some(s) = pressed.next() => (s.args().map(|a| a.shortcut_unique == ACTION), Event::Start),
-                    Some(s) = released.next() => (s.args().map(|a| a.shortcut_unique == ACTION), Event::Stop),
+                // Paste-last acts on release: held keys repeat their presses.
+                let event = tokio::select! {
+                    Some(s) = pressed.next() => s.args().ok().and_then(|a| (a.shortcut_unique == PUSH_TO_TALK).then_some(Event::Start)),
+                    Some(s) = released.next() => s.args().ok().and_then(|a| match a.shortcut_unique.as_str() {
+                        PUSH_TO_TALK => Some(Event::Stop),
+                        PASTE_LAST => Some(Event::PasteLast),
+                        _ => None,
+                    }),
                     else => break,
                 };
-                if matches!(signal, Ok(true)) && events.send(event).is_err() {
+                if let Some(event) = event
+                    && events.send(event).is_err()
+                {
                     break;
                 }
             }
@@ -88,7 +102,9 @@ impl Shortcut {
     }
 
     pub async fn unregister(&self) {
-        let _ = self.accel.set_inactive(&action_id()).await;
+        for (id, _) in ACTIONS {
+            let _ = self.accel.set_inactive(&id).await;
+        }
     }
 }
 

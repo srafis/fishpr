@@ -1,12 +1,13 @@
 //! Pastes into the focused window by pressing Ctrl+V (KWin doesn't allow
-//! wtype-style fake input, so we go below or around the compositor).
+//! wtype-style fake input, so we go below or around the compositor). The text
+//! is on the clipboard only for that paste; see clipboard.rs.
 //!
 //! Preferred: a virtual keyboard on /dev/uinput. Silent, but needs write
 //! access to the device (KDE Connect's udev rule grants it to the logged-in
 //! user). Fallback: the XDG RemoteDesktop portal, which works everywhere but
 //! asks permission once and shows a "remote control" notification per paste.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ashpd::desktop::{
@@ -14,9 +15,19 @@ use ashpd::desktop::{
     remote_desktop::{DeviceType, KeyState, RemoteDesktop, SelectDevicesOptions},
 };
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode, uinput::VirtualDevice};
+use smithay_client_toolkit::reexports::client::{
+    Connection, Dispatch, QueueHandle,
+    globals::{GlobalListContents, registry_queue_init},
+    protocol::wl_registry,
+};
+use wayland_protocols_plasma::keystate::client::org_kde_kwin_keystate::{self, OrgKdeKwinKeystate};
+
+use crate::{clipboard, desktop};
 
 const XK_CONTROL_L: i32 = 0xffe3;
 const XK_V: i32 = 0x0076;
+/// How long to wait for the user to let go of Ctrl, Alt, Shift and Meta.
+const MODIFIERS_WAIT: Duration = Duration::from_secs(10);
 
 pub struct Paster {
     keyboard: Option<VirtualDevice>,
@@ -32,10 +43,90 @@ impl Paster {
         Self { keyboard }
     }
 
-    pub async fn paste(&mut self) -> Result<()> {
+    /// Pastes `text` into the focused window, leaving the clipboard as it
+    /// was. Says whether an app took the text; false means nothing that
+    /// accepts text had focus, or the user kept holding modifier keys.
+    pub async fn paste(&mut self, text: &str) -> Result<bool> {
+        // Held from a shortcut, they'd turn Ctrl+V into, say, Ctrl+Alt+V,
+        // so the paste waits for the user to let go.
+        match tokio::task::spawn_blocking(|| modifiers_released(MODIFIERS_WAIT)).await? {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("fishpr: modifier keys still held, not pasting");
+                return Ok(false);
+            }
+            Err(e) => eprintln!("fishpr: can't see the modifier keys ({e:#}), pasting anyway"),
+        }
+        let lease = tokio::task::spawn_blocking({
+            let text = text.to_owned();
+            move || clipboard::lend(&text)
+        })
+        .await?;
+        let lease = match lease {
+            Ok(lease) => lease,
+            // Older Plasma lacks ext-data-control; the text stays on the clipboard there.
+            Err(e) => {
+                eprintln!("fishpr: can't lend the clipboard ({e:#}), leaving the text on it");
+                desktop::copy_to_clipboard(text).await?;
+                // Give wl-copy's background process a moment to take clipboard ownership.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                self.press().await?;
+                return Ok(true);
+            }
+        };
+        let pressed = self.press().await;
+        let landed = tokio::task::spawn_blocking(move || lease.give_back()).await?;
+        pressed.map(|()| landed)
+    }
+
+    async fn press(&mut self) -> Result<()> {
         match &mut self.keyboard {
             Some(keyboard) => uinput_paste(keyboard).await,
             None => portal_paste().await,
+        }
+    }
+}
+
+/// Waits up to `timeout` until Ctrl, Alt, Shift, AltGr and Meta are all up,
+/// as KWin's keystate protocol reports them. False if some are still down.
+fn modifiers_released(timeout: Duration) -> Result<bool> {
+    let conn = Connection::connect_to_env()?;
+    let (globals, mut queue) = registry_queue_init::<Modifiers>(&conn)?;
+    // Version 5 is the first to report modifiers.
+    let keystate: OrgKdeKwinKeystate = globals.bind(&queue.handle(), 5..=5, ()).context("KWin's keystate protocol is missing")?;
+    let mut held = Modifiers::default();
+    keystate.fetchStates();
+    queue.roundtrip(&mut held)?;
+    let deadline = Instant::now() + timeout;
+    while held.any() && Instant::now() < deadline {
+        clipboard::dispatch_for(&mut queue, &mut held, Duration::from_millis(20))?;
+    }
+    keystate.destroy();
+    Ok(!held.any())
+}
+
+/// Whether each modifier is down, by keystate's key number.
+#[derive(Default)]
+struct Modifiers([bool; 8]);
+
+impl Modifiers {
+    fn any(&self) -> bool {
+        // 0–2 are Caps, Num and Scroll Lock, which don't matter.
+        self.0[3..].iter().any(|&down| down)
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Modifiers {
+    fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<OrgKdeKwinKeystate, ()> for Modifiers {
+    fn event(held: &mut Self, _: &OrgKdeKwinKeystate, event: org_kde_kwin_keystate::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let org_kde_kwin_keystate::Event::StateChanged { key, state } = event {
+            // Anything but "unlocked": pressed, or latched by sticky keys.
+            if let Some(down) = held.0.get_mut(key as usize) {
+                *down = state != 0;
+            }
         }
     }
 }

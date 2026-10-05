@@ -1,3 +1,4 @@
+mod clipboard;
 mod control;
 mod desktop;
 mod hud;
@@ -29,13 +30,17 @@ const ICON_SIZE: u32 = 64;
 
 /// Everything the main loop reacts to: tray clicks and `fishpr --toggle`
 /// toggle, the shortcut starts on press and stops on release, and the HUD's
-/// retry button transcribes the last failed recording again.
+/// retry button transcribes the last failed recording again. The paste-last
+/// shortcut pastes the last transcription again, and the HUD's copy button
+/// copies it.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Event {
     Toggle,
     Start,
     Stop,
     Retry,
+    PasteLast,
+    CopyLast,
     Quit,
 }
 
@@ -114,16 +119,22 @@ fn opaque_bounds(img: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
     (x0 <= x1).then(|| (x0, y0, x1 - x0 + 1, y1 - y0 + 1))
 }
 
-/// Crops to the opaque pixels, centers on a transparent square (so the tray
-/// doesn't stretch it), and scales to a tray icon.
-fn load_icon(png: &[u8]) -> ksni::Icon {
-    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).expect("valid icon png").to_rgba8();
+/// The app icon, cropped to its opaque pixels and centered on a transparent
+/// square (so it isn't stretched), `size` pixels across.
+pub fn icon(size: u32) -> RgbaImage {
+    let img = image::load_from_memory_with_format(include_bytes!("../assets/icon.png"), image::ImageFormat::Png)
+        .expect("valid icon png")
+        .to_rgba8();
     let (x, y, w, h) = opaque_bounds(&img).unwrap_or((0, 0, img.width(), img.height()));
     let cropped = image::imageops::crop_imm(&img, x, y, w, h).to_image();
     let side = w.max(h);
     let mut canvas = RgbaImage::new(side, side);
     image::imageops::overlay(&mut canvas, &cropped, ((side - w) / 2).into(), ((side - h) / 2).into());
-    let mut data = image::imageops::resize(&canvas, ICON_SIZE, ICON_SIZE, FilterType::Lanczos3).into_vec();
+    image::imageops::resize(&canvas, size, size, FilterType::Lanczos3)
+}
+
+fn tray_icon() -> ksni::Icon {
+    let mut data = icon(ICON_SIZE).into_vec();
     for px in data.chunks_exact_mut(4) {
         px.rotate_right(1); // RGBA -> ARGB
     }
@@ -146,6 +157,20 @@ impl Ui {
             State::Loading | State::Idle => self.hud.hide(),
         }
     }
+
+    /// Shows a transcription that nothing took, with a button to copy it.
+    /// Without the HUD, copies it right away.
+    async fn offer(&mut self, text: &str) {
+        self.tray.update(|t| t.state = State::Idle).await;
+        if self.hud.is_available() {
+            self.hud.offer(text);
+        } else {
+            self.hud.hide();
+            let copied = desktop::copy_to_clipboard(text).await;
+            let summary = if copied.is_ok() { "Nowhere to paste — copied to your clipboard" } else { "Nowhere to paste" };
+            desktop::notify(summary, text);
+        }
+    }
 }
 
 /// `~/.local/share/fishpr`, where the model and portal token live.
@@ -157,27 +182,30 @@ fn data_dir() -> Result<PathBuf> {
     Ok(base.join("fishpr"))
 }
 
-/// Waits for the transcript of `samples` and puts it on the clipboard. None
-/// means nobody spoke. A retry skips the voice check, in case it was wrong.
+/// Waits for the transcript of `samples`. None means nobody spoke. A retry
+/// skips the voice check, in case it was wrong.
 async fn transcribe(transcriber: &Transcriber, session: Session, samples: &[i16], check_speech: bool) -> Result<Option<String>> {
     if check_speech && !transcriber.has_speech(samples).await? {
         return Ok(None);
     }
     let text = session.finish().await?;
-    if text.is_empty() {
-        return Ok(None);
-    }
-    desktop::copy_to_clipboard(&text).await?;
-    Ok(Some(text))
+    Ok(Some(text).filter(|t| !t.is_empty()))
 }
 
-/// Pastes a finished transcription, or offers a retry in the HUD when it
-/// failed or heard no speech. Returns the recording to keep for that retry.
-async fn settle(ui: &mut Ui, paster: &mut paste::Paster, result: Result<Option<String>>, samples: Vec<i16>) -> Option<Vec<i16>> {
+/// Pastes a finished transcription, keeping it as the last one, or offers a
+/// retry in the HUD when it failed or heard no speech. Returns the recording
+/// to keep for that retry.
+async fn settle(
+    ui: &mut Ui,
+    paster: &mut paste::Paster,
+    last: &mut Option<String>,
+    result: Result<Option<String>>,
+    samples: Vec<i16>,
+) -> Option<Vec<i16>> {
     let (no_speech, problem) = match result {
         Ok(Some(text)) => {
-            ui.set(State::Idle).await;
-            deliver(paster, &text).await;
+            deliver(ui, paster, &text).await;
+            *last = Some(text);
             return None;
         }
         Ok(None) => (true, "no speech detected".to_string()),
@@ -191,14 +219,16 @@ async fn settle(ui: &mut Ui, paster: &mut paste::Paster, result: Result<Option<S
     Some(samples)
 }
 
-/// Pastes the transcription into the focused window. The text is already on
-/// the clipboard, so a failed paste still leaves it one Ctrl+V away.
-async fn deliver(paster: &mut paste::Paster, text: &str) {
-    // Give wl-copy's background process a moment to take clipboard ownership.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    if let Err(e) = paster.paste().await {
-        eprintln!("fishpr: paste failed: {e:#}");
-        desktop::notify("Couldn't paste — text is on your clipboard", &format!("{e:#}\n\n{text}"));
+/// Pastes the transcription into the focused window. When nothing takes it
+/// (no text field has focus), the HUD shows it with a copy button instead.
+async fn deliver(ui: &mut Ui, paster: &mut paste::Paster, text: &str) {
+    match paster.paste(text).await {
+        Ok(true) => ui.set(State::Idle).await,
+        Ok(false) => ui.offer(text).await,
+        Err(e) => {
+            eprintln!("fishpr: paste failed: {e:#}");
+            ui.offer(text).await;
+        }
     }
 }
 
@@ -236,9 +266,7 @@ async fn main() -> Result<()> {
     let (events_tx, mut events) = mpsc::unbounded_channel();
     let _control = control::serve(events_tx.clone()).await?;
 
-    let icon = load_icon(include_bytes!("../assets/icon.png"));
-
-    let tray = FishTray { state: State::Loading, icon, events: events_tx.clone() };
+    let tray = FishTray { state: State::Loading, icon: tray_icon(), events: events_tx.clone() };
     // Without a tray host (no System Tray widget in the panel), keep running
     // without the icon; it appears if one shows up later.
     let tray = tray.assume_sni_available(true).spawn().await?;
@@ -296,6 +324,8 @@ async fn main() -> Result<()> {
     let mut recording: Option<(Recording, Session)> = None;
     // The last recording, while it failed to transcribe and can be retried.
     let mut failed: Option<Vec<i16>> = None;
+    // The last transcription, for the paste-last shortcut and the HUD's copy button.
+    let mut last: Option<String> = None;
 
     while !quit {
         let Some(event) = events.recv().await else { break };
@@ -317,13 +347,26 @@ async fn main() -> Result<()> {
                 }
             }
             // Key auto-repeat sends more presses while held; keep recording.
-            (Event::Start | Event::Retry, Some(r)) => recording = Some(r),
+            (Event::Start | Event::Retry | Event::PasteLast, Some(r)) => recording = Some(r),
             (Event::Stop, None) => {}
+            (Event::PasteLast, None) => {
+                let Some(text) = last.clone() else { continue };
+                deliver(&mut ui, &mut paster, &text).await;
+                quit = drain(&mut events);
+            }
+            (Event::CopyLast, r) => {
+                recording = r;
+                if let Some(text) = &last
+                    && let Err(e) = desktop::copy_to_clipboard(text).await
+                {
+                    desktop::notify("Couldn't copy", &format!("{e:#}"));
+                }
+            }
             (Event::Retry, None) => {
                 let Some(samples) = failed.take() else { continue };
                 ui.set(State::Transcribing).await;
                 let result = transcribe(&transcriber, transcriber.replay(&samples), &samples, false).await;
-                failed = settle(&mut ui, &mut paster, result, samples).await;
+                failed = settle(&mut ui, &mut paster, &mut last, result, samples).await;
                 quit = drain(&mut events);
             }
             (Event::Toggle | Event::Stop, Some((r, session))) => {
@@ -331,7 +374,7 @@ async fn main() -> Result<()> {
                 match r.stop().await {
                     Ok(samples) => {
                         let result = transcribe(&transcriber, session, &samples, true).await;
-                        failed = settle(&mut ui, &mut paster, result, samples).await;
+                        failed = settle(&mut ui, &mut paster, &mut last, result, samples).await;
                     }
                     // Nothing was recorded, so there's nothing to retry.
                     Err(e) => {
