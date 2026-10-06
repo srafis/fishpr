@@ -28,7 +28,8 @@ shlibs=$(mktemp -d)
 mkdir "$shlibs/debian"
 printf 'Source: fishpr\n\nPackage: fishpr\nArchitecture: amd64\n' > "$shlibs/debian/control"
 # Ubuntu calls some of them libfoo6t64 where Debian has libfoo6, so either will do.
-shlibdeps=$(cd "$shlibs" && dpkg-shlibdeps -O "$src/fishpr" | sed -n 's/^shlibs:Depends=//p' |
+shlibdeps=$(cd "$shlibs" && dpkg-shlibdeps -O "$root/usr/bin/fishpr")
+shlibdeps=$(printf '%s\n' "$shlibdeps" | sed -n 's/^shlibs:Depends=//p' |
     sed -E 's/(lib[a-z0-9.+-]+)t64( \([^)]*\))?/\1t64\2 | \1\2/g')
 rm -r "$shlibs"
 
