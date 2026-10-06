@@ -19,6 +19,7 @@
 - **Shows it when there's nowhere to paste.** If no text field takes the paste, the pill grows into a card that shows what you said, with a **Copy** button, for ten seconds. Resting the pointer on it keeps it open.
 - **Paste it again.** <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> pastes your last transcription again, wherever the cursor is now.
 - **Esc to cancel.** While the pill shows, <kbd>Esc</kbd> cancels the recording or transcription, and the pill offers a retry for three seconds in case you didn't mean it. On a retry button or the card, <kbd>Esc</kbd> hides it. Only fishpr sees that <kbd>Esc</kbd>, not the app you're in; the rest of the time, <kbd>Esc</kbd> works as usual.
+- **History.** Everything you dictate is kept, with its recording. Right-click the tray icon → **Open fishpr** to see it by day, copy any of it again, play the recording, save it elsewhere, or delete it. On the entry you've moved to with the arrow keys, <kbd>Space</kbd> plays it, <kbd>Ctrl</kbd>+<kbd>C</kbd> copies it, <kbd>Ctrl</kbd>+<kbd>S</kbd> saves the recording, <kbd>Enter</kbd> shows it in its folder, and <kbd>Del</kbd> deletes it. It all stays on your computer, in `~/.local/share/fishpr/history/`.
 - **Retry when it fails.** If transcription fails, the pill stays for ten seconds with a retry button, and a click sends the same recording again. Nothing you said is lost to a network hiccup.
 - **Ignores silence.** A local voice check runs on every recording, so an accidental press with nobody speaking pastes nothing, instead of a made-up "Thank you." The pill says "No speech detected" and offers a retry, which skips the voice check in case it was wrong.
 
@@ -89,26 +90,28 @@ On Fedora:
 sudo dnf remove fishpr
 ```
 
-The downloaded model and settings are in `~/.local/share/fishpr/`.
+The downloaded model, settings, and your history are in `~/.local/share/fishpr/`. Uninstalling leaves them; delete the folder to remove them too.
 
 ### Build from source
 
-You need a Rust toolchain (1.85 or later), plus **cmake** and **clang** to compile whisper.cpp, which provides the voice check. On Arch:
+You need a Rust toolchain (1.85 or later), plus **cmake** and **clang** to compile whisper.cpp, which provides the voice check, and Qt 6 for the window. On Arch:
 
 ```sh
-sudo pacman -S --needed rust cmake clang pipewire-audio wl-clipboard libnotify
+sudo pacman -S --needed rust cmake clang qt6-base qt6-declarative kirigami qqc2-desktop-style pipewire-audio wl-clipboard libnotify
 ```
 
 On Ubuntu or Debian, install Rust with [rustup](https://rustup.rs) (the distro's is too old), then:
 
 ```sh
-sudo apt install build-essential cmake clang libclang-dev pipewire-bin wl-clipboard libnotify-bin
+sudo apt install build-essential cmake clang libclang-dev qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools \
+  qml6-module-org-kde-kirigami qml6-module-org-kde-qqc2desktopstyle qml6-module-qtquick-dialogs qml6-module-qtcore pipewire-bin wl-clipboard libnotify-bin
 ```
 
 On Fedora (the distro's Rust may be too old, so use [rustup](https://rustup.rs) if `rustc --version` is below 1.85):
 
 ```sh
-sudo dnf install rust cargo cmake clang clang-devel gcc-c++ pipewire-utils wl-clipboard libnotify
+sudo dnf install rust cargo cmake clang clang-devel gcc-c++ qt6-qtbase-devel qt6-qtdeclarative-devel kf6-kirigami kf6-qqc2-desktop-style \
+  pipewire-utils wl-clipboard libnotify
 ```
 
 Then build and install:
@@ -121,7 +124,7 @@ sed "s|^Exec=.*|Exec=$HOME/.local/bin/fishpr|" packaging/io.github.srafis.fishpr
 install -Dm644 io.github.srafis.fishpr.desktop -t ~/.local/share/applications
 ```
 
-The binary is self-contained, about 14 MB. The desktop entry puts fishpr in the app menu, and the desktop portal needs it to recognize fishpr. To start fishpr on login, also copy that `io.github.srafis.fishpr.desktop` to `~/.config/autostart/`. To start it now, without logging out:
+The binary is a single file, about 14 MB, that uses the system's Qt for its window. The desktop entry puts fishpr in the app menu, and the desktop portal needs it to recognize fishpr. To start fishpr on login, also copy that `io.github.srafis.fishpr.desktop` to `~/.config/autostart/`. To start it now, without logging out:
 
 ```sh
 systemd-run --user --unit=app-io.github.srafis.fishpr --collect ~/.local/bin/fishpr
@@ -140,6 +143,8 @@ On first launch fishpr downloads the voice-activity model (Silero VAD, ~1 MB) to
 | Press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> | Your last transcription pasted again |
 | Press <kbd>Esc</kbd> while the pill shows | Recording or transcription cancelled, or the pill hidden |
 | Run `fishpr --toggle` | Starts recording, or stops and pastes, like a tray click |
+| Right-click the tray icon | **Start Recording**, **Paste Last Transcription**, each with its shortcut, **Open fishpr**, and **Quit** |
+| Right-click the tray icon → **Open fishpr**, or run `fishpr --window` | The window, with your history |
 | Right-click the tray icon → **Quit**, or run `pkill -x fishpr` | fishpr exits and releases <kbd>Ctrl</kbd>+<kbd>Space</kbd> |
 
 **Changing the shortcuts:** <kbd>Ctrl</kbd>+<kbd>Space</kbd>, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd>, and <kbd>Esc</kbd> are only the defaults, and your choices are kept across restarts. Rebind them in **System Settings → Keyboard → Shortcuts → fishpr → Push to talk (hold)**, **Paste last transcription**, and **Cancel or dismiss (while showing)**. While fishpr is running, the desktop captures the combo, so apps no longer see it. In most IDEs <kbd>Ctrl</kbd>+<kbd>Space</kbd> is "trigger suggestions", so rebind it if you miss that.
@@ -190,6 +195,8 @@ To see what fishpr is doing, run it in a terminal: `pkill fishpr; fishpr`. When 
 | [`src/paste.rs`](src/paste.rs) | Ctrl+V via uinput, with the portal fallback, once the modifier keys are up |
 | [`src/clipboard.rs`](src/clipboard.rs) | Lends the text to the clipboard for one paste, then puts back what was there (ext-data-control) |
 | [`src/desktop.rs`](src/desktop.rs) | Copying to the clipboard, and notifications |
+| [`src/history.rs`](src/history.rs) | Keeps every transcription and its recording in `~/.local/share/fishpr/history/` |
+| [`src/window.rs`](src/window.rs), [`src/window/`](src/window/) | The window (`fishpr --window`): a Kirigami app in QML, bridged to Rust with [CXX-Qt](https://github.com/KDAB/cxx-qt) |
 | [`install.sh`](install.sh) | The one-line installer: adds the pacman or apt repo, or downloads the Fedora RPM, installs, starts |
 | [`packaging/`](packaging/) | `fishpr-bin` PKGBUILD, the `.deb` builder, the RPM spec, desktop entry, uinput udev rule |
 | [`site/`](site/) | The marketing page, published to GitHub Pages by [`pages.yml`](.github/workflows/pages.yml) when it changes on `main` |

@@ -5,7 +5,7 @@ fishpr is push-to-talk dictation for KDE Plasma 6 on Wayland, written in Rust. [
 ## Build and test
 
 ```sh
-cargo build --release   # needs rust, cmake, clang (whisper.cpp builds from source)
+cargo build --release   # needs rust, cmake, clang (whisper.cpp builds from source), and Qt 6 (qt6-base, qt6-declarative)
 cargo test
 ```
 

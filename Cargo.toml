@@ -9,6 +9,9 @@ ab_glyph = "0.2.32"
 anyhow = "1.0.104"
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
 base64 = "0.23.1"
+cxx = "1"
+cxx-qt = "0.10"
+cxx-qt-lib = "0.10"
 evdev = "0.13.2"
 futures-util = "0.3.34"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
@@ -26,3 +29,6 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 [profile.release]
 strip = true
 lto = true
+
+[build-dependencies]
+cxx-qt-build = "0.10"

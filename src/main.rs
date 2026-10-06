@@ -1,11 +1,13 @@
 mod clipboard;
 mod control;
 mod desktop;
+mod history;
 mod hud;
 mod paste;
 mod recorder;
 mod shortcut;
 mod transcribe;
+mod window;
 
 use std::path::PathBuf;
 
@@ -21,10 +23,11 @@ use transcribe::{Session, Transcriber};
 /// unsandboxed app whose reverse-DNS ID has a .desktop file.
 pub const APP_ID: &str = "io.github.srafis.fishpr";
 
-const USAGE: &str = "usage: fishpr [--toggle]
+const USAGE: &str = "usage: fishpr [--toggle | --window]
 
 With no options, starts fishpr. --toggle starts or stops recording in the
-running fishpr; bind it to a key where fishpr can't register its shortcut.";
+running fishpr; bind it to a key where fishpr can't register its shortcut.
+--window opens the window with your history.";
 
 const ICON_SIZE: u32 = 64;
 
@@ -60,6 +63,10 @@ struct FishTray {
     state: State,
     icon: ksni::Icon,
     events: mpsc::UnboundedSender<Event>,
+    /// The shortcuts' keys, shown in the menu.
+    bindings: shortcut::Bindings,
+    /// Whether there's a transcription to paste again.
+    has_last: bool,
 }
 
 impl ksni::Tray for FishTray {
@@ -80,22 +87,55 @@ impl ksni::Tray for FishTray {
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
-        let description = match self.state {
-            State::Loading => "Starting…",
-            State::Idle | State::Failed { .. } => "Click or hold Ctrl+Space to record",
-            State::Recording => "Recording… click or release to transcribe",
-            State::Transcribing => "Transcribing…",
+        let description = match (self.state, shortcut::label(&self.bindings.push_to_talk)) {
+            (State::Loading, _) => "Starting…".into(),
+            (State::Idle | State::Failed { .. }, Some(keys)) => format!("Click or hold {keys} to record"),
+            (State::Idle | State::Failed { .. }, None) => "Click to record".into(),
+            (State::Recording, _) => "Recording… click or release to transcribe".into(),
+            (State::Transcribing, _) => "Transcribing…".into(),
         };
         ksni::ToolTip {
             title: "fishpr".into(),
-            description: description.into(),
+            description,
             ..Default::default()
         }
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
+        let recording = matches!(self.state, State::Recording);
         vec![
+            StandardItem {
+                label: if recording { "Stop Recording" } else { "Start Recording" }.into(),
+                icon_name: if recording { "media-playback-stop" } else { "media-record" }.into(),
+                enabled: !matches!(self.state, State::Loading | State::Transcribing),
+                shortcut: shortcut::menu_shortcut(&self.bindings.push_to_talk),
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.events.send(Event::Toggle);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Paste Last Transcription".into(),
+                icon_name: "edit-paste".into(),
+                enabled: self.has_last && !recording,
+                shortcut: shortcut::menu_shortcut(&self.bindings.paste_last),
+                activate: Box::new(|t: &mut Self| {
+                    let _ = t.events.send(Event::PasteLast);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            StandardItem {
+                label: "Open fishpr".into(),
+                icon_name: "fishpr".into(),
+                activate: Box::new(|_: &mut Self| window::open()),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
             StandardItem {
                 label: "Quit".into(),
                 icon_name: "application-exit".into(),
@@ -193,9 +233,9 @@ async fn transcribe(transcriber: &Transcriber, session: Session, samples: &[i16]
     Ok(Some(text).filter(|t| !t.is_empty()))
 }
 
-/// Pastes a finished transcription, keeping it as the last one, or offers a
-/// retry in the HUD when it failed or heard no speech. Returns the recording
-/// to keep for that retry.
+/// Pastes a finished transcription, keeping it as the last one and in the
+/// history, or offers a retry in the HUD when it failed or heard no speech.
+/// Returns the recording to keep for that retry.
 async fn settle(
     ui: &mut Ui,
     paster: &mut paste::Paster,
@@ -205,6 +245,11 @@ async fn settle(
 ) -> Option<Vec<i16>> {
     let (why, problem) = match result {
         Ok(Some(text)) => {
+            ui.tray.update(|t| t.has_last = true).await;
+            tokio::task::spawn_blocking({
+                let text = text.clone();
+                move || history::save(&text, &samples).inspect_err(|e| eprintln!("fishpr: couldn't save to the history: {e:#}"))
+            });
             deliver(ui, paster, &text).await;
             *last = Some(text);
             return None;
@@ -267,21 +312,26 @@ fn drain(events: &mut mpsc::UnboundedReceiver<Event>) -> bool {
     quit
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // The window runs Qt on this thread, so it's chosen before tokio starts.
+    let runtime = || tokio::runtime::Runtime::new();
     match std::env::args().nth(1).as_deref() {
-        None => {}
-        Some("--toggle") => return control::toggle().await,
+        None => runtime()?.block_on(run()),
+        Some("--toggle") => runtime()?.block_on(control::toggle()),
+        Some("--window") => window::run(),
         Some("-h" | "--help") => {
             println!("{USAGE}");
-            return Ok(());
+            Ok(())
         }
         Some(arg) => {
             eprintln!("fishpr: unknown option {arg}\n\n{USAGE}");
             std::process::exit(2);
         }
     }
+}
 
+/// Runs fishpr: the tray icon, the shortcuts, and dictation.
+async fn run() -> Result<()> {
     // Must come before any other portal call. Portals older than 1.19 don't
     // have it and guess the ID from the systemd unit name instead.
     if let Err(e) = ashpd::register_host_app(APP_ID.parse().expect("valid app id")).await {
@@ -291,7 +341,13 @@ async fn main() -> Result<()> {
     let (events_tx, mut events) = mpsc::unbounded_channel();
     let _control = control::serve(events_tx.clone()).await?;
 
-    let tray = FishTray { state: State::Loading, icon: tray_icon(), events: events_tx.clone() };
+    let tray = FishTray {
+        state: State::Loading,
+        icon: tray_icon(),
+        events: events_tx.clone(),
+        bindings: shortcut::Bindings::default(),
+        has_last: false,
+    };
     // Without a tray host (no System Tray widget in the panel), keep running
     // without the icon; it appears if one shows up later.
     let tray = tray.assume_sni_available(true).spawn().await?;
@@ -311,7 +367,17 @@ async fn main() -> Result<()> {
     // Said once rather than at every login: where there's no KGlobalAccel
     // (desktops other than Plasma), the user binds `fishpr --toggle` once and is done.
     let told_marker = data_dir().map(|d| d.join("shortcut-unavailable"));
-    let shortcut = match shortcut::Shortcut::register(events_tx.clone(), ui.hud.visibility()).await {
+    let (bindings_tx, mut bindings) = tokio::sync::watch::channel(shortcut::Bindings::default());
+    tokio::spawn({
+        let tray = ui.tray.clone();
+        async move {
+            while bindings.changed().await.is_ok() {
+                let bound = bindings.borrow_and_update().clone();
+                tray.update(|t| t.bindings = bound).await;
+            }
+        }
+    });
+    let shortcut = match shortcut::Shortcut::register(events_tx.clone(), ui.hud.visibility(), bindings_tx).await {
         Ok(s) => {
             if let Ok(marker) = &told_marker {
                 let _ = std::fs::remove_file(marker);
@@ -349,8 +415,10 @@ async fn main() -> Result<()> {
     let mut recording: Option<(Recording, Session)> = None;
     // The last recording, while it failed to transcribe and can be retried.
     let mut failed: Option<Vec<i16>> = None;
-    // The last transcription, for the paste-last shortcut and the HUD's copy button.
-    let mut last: Option<String> = None;
+    // The last transcription, for the paste-last shortcut and the HUD's copy
+    // button. After a restart, the newest one in the history.
+    let mut last: Option<String> = history::list().ok().and_then(|entries| entries.into_iter().next()).map(|entry| entry.text);
+    ui.tray.update(|t| t.has_last = last.is_some()).await;
 
     while !quit {
         let Some(event) = events.recv().await else { break };

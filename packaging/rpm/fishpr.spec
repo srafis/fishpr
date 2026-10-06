@@ -16,6 +16,9 @@ Requires:       pipewire-utils
 Requires:       wl-clipboard
 Requires:       libnotify
 Recommends:     xclip
+# The window. The Qt libraries it links are required automatically.
+Recommends:     kf6-kirigami
+Recommends:     kf6-qqc2-desktop-style
 
 # The release profile already strips the binary.
 %global debug_package %{nil}

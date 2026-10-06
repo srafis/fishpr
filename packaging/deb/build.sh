@@ -22,11 +22,18 @@ install -Dm644 "$src/fishpr.png" -t "$root/usr/share/pixmaps"
 mkdir -p "$root/usr/share/doc/fishpr"
 cat "$src/LICENSE" "$src/NotoSans-OFL.txt" > "$root/usr/share/doc/fishpr/copyright"
 
-# The newest glibc symbol version the binary uses is the oldest glibc it runs on.
-glibc=$(objdump -T "$src/fishpr" | grep -o 'GLIBC_[0-9.]*' | cut -d_ -f2 | sort -uV | tail -n1)
+# The packages that provide the libraries the binary links (glibc, Qt), at
+# the versions it needs. dpkg-shlibdeps wants to run in a source package.
+shlibs=$(mktemp -d)
+mkdir "$shlibs/debian"
+printf 'Source: fishpr\n\nPackage: fishpr\nArchitecture: amd64\n' > "$shlibs/debian/control"
+# Ubuntu calls some of them libfoo6t64 where Debian has libfoo6, so either will do.
+shlibdeps=$(cd "$shlibs" && dpkg-shlibdeps -O "$src/fishpr" | sed -n 's/^shlibs:Depends=//p' |
+    sed -E 's/(lib[a-z0-9.+-]+)t64( \([^)]*\))?/\1t64\2 | \1\2/g')
+rm -r "$shlibs"
 
 mkdir "$root/DEBIAN"
-sed -e "s/@VERSION@/$version/" -e "s/@GLIBC@/$glibc/" \
+sed -e "s/@VERSION@/$version/" -e "s/@SHLIBDEPS@/$shlibdeps/" \
     -e "s/@SIZE@/$(du -sk --exclude=DEBIAN "$root" | cut -f1)/" "$here/control" > "$root/DEBIAN/control"
 install -m755 "$here/postinst" "$root/DEBIAN/postinst"
 echo /etc/xdg/autostart/io.github.srafis.fishpr.desktop > "$root/DEBIAN/conffiles"

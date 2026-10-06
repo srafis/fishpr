@@ -37,7 +37,7 @@ jobs:
       GGML_NATIVE: 'OFF'
     steps:
       - name: Install build tools
-        run: pacman -Syu --noconfirm --needed rust cmake clang git github-cli
+        run: pacman -Syu --noconfirm --needed rust cmake clang git github-cli qt6-base qt6-declarative
 
       - uses: actions/checkout@v5
 
@@ -128,7 +128,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential cmake clang libclang-dev \
-            dpkg-dev apt-utils binutils gnupg gh
+            dpkg-dev apt-utils binutils gnupg gh qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools
           # Ubuntu's own Rust is too old for edition 2024.
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -204,7 +204,7 @@ jobs:
     steps:
       - name: Install build tools
         run: |
-          dnf install -y git gcc gcc-c++ cmake clang clang-devel rpm-build rpm-sign gnupg2 gh
+          dnf install -y git gcc gcc-c++ cmake clang clang-devel rpm-build rpm-sign gnupg2 gh qt6-qtbase-devel qt6-qtdeclarative-devel
           # Fedora's own Rust can lag behind edition 2024.
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
