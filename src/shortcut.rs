@@ -10,6 +10,10 @@
 //! a restart. In toggle mode KGlobalAccel's repeated presses while a key is
 //! held must not toggle again; only the first press counts.
 //!
+//! All component signals are read from one ordered D-Bus stream. Reading
+//! presses and releases from separate streams lets a quick tap's release
+//! overtake its press, which corrupts the held-key state.
+//!
 //! Esc is grabbed only while the HUD is on screen. KWin then keeps it from
 //! the focused app; the rest of the time, apps get it as usual.
 
@@ -96,6 +100,20 @@ impl Bindings {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortcutSignal {
+    Pressed,
+    Released,
+}
+
+#[derive(Default)]
+struct ShortcutState {
+    esc_down: bool,
+    /// None while the keys are up; otherwise whether that press began in
+    /// toggle mode, so its release doesn't stop a toggle recording.
+    push_to_talk_down: Option<bool>,
+}
+
 /// Keeps the shortcuts registered; call `unregister` before exiting so KWin
 /// stops grabbing the keys while fishpr isn't running.
 pub struct Shortcut {
@@ -158,37 +176,27 @@ impl Shortcut {
 
         let path = accel.get_component(COMPONENT).await?;
         let component = ComponentProxy::builder(&conn).path(path)?.build().await?;
-        let mut pressed = component.receive_global_shortcut_pressed().await?;
-        let mut released = component.receive_global_shortcut_released().await?;
+        // Keep press and release in one D-Bus-ordered stream. Reading them
+        // from separate streams lets tokio::select! process a quick tap's
+        // release before its press, leaving the shortcut state one press behind.
+        let mut signals = component.inner().receive_all_signals().await?;
         tokio::spawn(async move {
-            // Held keys repeat their presses. Paste-last acts on release
-            // instead, Esc only on its first press, and push-to-talk only on
-            // the first press of each physical key press.
-            let mut esc_down = false;
-            // None while the keys are up; otherwise whether that press began in
-            // toggle mode (so its release doesn't stop a toggle recording).
-            let mut push_to_talk_down = None;
-            loop {
-                let event = tokio::select! {
-                    Some(s) = pressed.next() => s.args().ok().and_then(|a| match a.shortcut_unique.as_str() {
-                        PUSH_TO_TALK => push_to_talk_pressed(toggle_mode.load(Ordering::Relaxed), &mut push_to_talk_down),
-                        DISMISS if !esc_down => {
-                            esc_down = true;
-                            Some(Event::Dismiss)
-                        }
-                        _ => None,
-                    }),
-                    Some(s) = released.next() => s.args().ok().and_then(|a| match a.shortcut_unique.as_str() {
-                        PUSH_TO_TALK => push_to_talk_released(&mut push_to_talk_down),
-                        PASTE_LAST => Some(Event::PasteLast),
-                        DISMISS => {
-                            esc_down = false;
-                            None
-                        }
-                        _ => None,
-                    }),
-                    else => break,
+            // KGlobalAccel sends globalShortcutRepeated while a key is held;
+            // it's ignored here. Paste-last acts on release, Esc only on its
+            // first press, and push-to-talk only on the first press of each
+            // physical key press.
+            let mut state = ShortcutState::default();
+            while let Some(message) = signals.next().await {
+                let signal = match message.header().member().map(|member| member.as_str()) {
+                    Some("globalShortcutPressed") => ShortcutSignal::Pressed,
+                    Some("globalShortcutReleased") => ShortcutSignal::Released,
+                    _ => continue,
                 };
+                let body = message.body();
+                let Ok((_, shortcut, _)) = body.deserialize::<(String, String, i64)>() else {
+                    continue;
+                };
+                let event = handle_signal(signal, &shortcut, toggle_mode.load(Ordering::Relaxed), &mut state);
                 if let Some(event) = event
                     && events.send(event).is_err()
                 {
@@ -217,8 +225,34 @@ fn push_to_talk_pressed(toggle: bool, down: &mut Option<bool>) -> Option<Event> 
     Some(if toggle { Event::Toggle } else { Event::Start })
 }
 
-fn push_to_talk_released(down: &mut Option<bool>) -> Option<Event> {
-    matches!(down.take(), Some(false)).then_some(Event::Stop)
+fn push_to_talk_released(toggle_now: bool, down: &mut Option<bool>) -> Option<Event> {
+    match down.take() {
+        // The press began in hold mode.
+        Some(false) => Some(Event::Stop),
+        // The mode changed to hold while a toggle-mode press was still held.
+        Some(true) if !toggle_now => Some(Event::Stop),
+        // A toggle-mode release does nothing.
+        _ => None,
+    }
+}
+
+/// Applies one KGlobalAccel signal in D-Bus order. Keeping this pure makes the
+/// press/release ordering and held-key rules testable without a session bus.
+fn handle_signal(signal: ShortcutSignal, shortcut: &str, toggle: bool, state: &mut ShortcutState) -> Option<Event> {
+    match (signal, shortcut) {
+        (ShortcutSignal::Pressed, PUSH_TO_TALK) => push_to_talk_pressed(toggle, &mut state.push_to_talk_down),
+        (ShortcutSignal::Released, PUSH_TO_TALK) => push_to_talk_released(toggle, &mut state.push_to_talk_down),
+        (ShortcutSignal::Pressed, DISMISS) if !state.esc_down => {
+            state.esc_down = true;
+            Some(Event::Dismiss)
+        }
+        (ShortcutSignal::Released, DISMISS) => {
+            state.esc_down = false;
+            None
+        }
+        (ShortcutSignal::Released, PASTE_LAST) => Some(Event::PasteLast),
+        _ => None,
+    }
 }
 
 /// Decides by the desktop, not by whether KGlobalAccel answers: D-Bus would
@@ -326,8 +360,8 @@ mod tests {
         let mut down = None;
         assert_eq!(push_to_talk_pressed(false, &mut down), Some(Event::Start));
         assert_eq!(push_to_talk_pressed(false, &mut down), None);
-        assert_eq!(push_to_talk_released(&mut down), Some(Event::Stop));
-        assert_eq!(push_to_talk_released(&mut down), None);
+        assert_eq!(push_to_talk_released(false, &mut down), Some(Event::Stop));
+        assert_eq!(push_to_talk_released(false, &mut down), None);
     }
 
     #[test]
@@ -336,18 +370,62 @@ mod tests {
         assert_eq!(push_to_talk_pressed(true, &mut down), Some(Event::Toggle));
         // Key auto-repeat while the shortcut is held.
         assert_eq!(push_to_talk_pressed(true, &mut down), None);
-        assert_eq!(push_to_talk_released(&mut down), None);
+        assert_eq!(push_to_talk_released(true, &mut down), None);
         assert_eq!(push_to_talk_pressed(true, &mut down), Some(Event::Toggle));
-        assert_eq!(push_to_talk_released(&mut down), None);
+        assert_eq!(push_to_talk_released(true, &mut down), None);
     }
 
     #[test]
     fn changing_the_mode_mid_hold_finishes_the_old_gesture() {
         let mut down = None;
         assert_eq!(push_to_talk_pressed(false, &mut down), Some(Event::Start));
-        // The setting changed while the key was still down.
-        assert_eq!(push_to_talk_released(&mut down), Some(Event::Stop));
+        // The setting changed to toggle while the key was still down.
+        assert_eq!(push_to_talk_released(true, &mut down), Some(Event::Stop));
         assert_eq!(push_to_talk_pressed(true, &mut down), Some(Event::Toggle));
+    }
+
+    #[test]
+    fn changing_the_mode_mid_toggle_finishes_the_old_gesture() {
+        let mut down = None;
+        assert_eq!(push_to_talk_pressed(true, &mut down), Some(Event::Toggle));
+        // The setting changed to hold while the key was still down.
+        assert_eq!(push_to_talk_released(false, &mut down), Some(Event::Stop));
+        assert_eq!(push_to_talk_pressed(false, &mut down), Some(Event::Start));
+    }
+
+    #[test]
+    fn quick_toggle_taps_each_start_or_stop_once() {
+        let mut state = ShortcutState::default();
+        assert_eq!(handle_signal(ShortcutSignal::Pressed, PUSH_TO_TALK, true, &mut state), Some(Event::Toggle));
+        assert_eq!(handle_signal(ShortcutSignal::Released, PUSH_TO_TALK, true, &mut state), None);
+        assert_eq!(handle_signal(ShortcutSignal::Pressed, PUSH_TO_TALK, true, &mut state), Some(Event::Toggle));
+        assert_eq!(handle_signal(ShortcutSignal::Released, PUSH_TO_TALK, true, &mut state), None);
+    }
+
+    #[test]
+    fn hold_quick_tap_starts_and_stops_in_order() {
+        let mut state = ShortcutState::default();
+        assert_eq!(handle_signal(ShortcutSignal::Pressed, PUSH_TO_TALK, false, &mut state), Some(Event::Start));
+        assert_eq!(handle_signal(ShortcutSignal::Released, PUSH_TO_TALK, false, &mut state), Some(Event::Stop));
+    }
+
+    #[test]
+    fn escape_and_paste_last_keep_their_release_semantics() {
+        let mut state = ShortcutState::default();
+        assert_eq!(handle_signal(ShortcutSignal::Pressed, DISMISS, false, &mut state), Some(Event::Dismiss));
+        assert_eq!(handle_signal(ShortcutSignal::Pressed, DISMISS, false, &mut state), None);
+        assert_eq!(handle_signal(ShortcutSignal::Released, DISMISS, false, &mut state), None);
+        assert_eq!(handle_signal(ShortcutSignal::Pressed, DISMISS, false, &mut state), Some(Event::Dismiss));
+
+        assert_eq!(handle_signal(ShortcutSignal::Pressed, PASTE_LAST, false, &mut state), None);
+        assert_eq!(handle_signal(ShortcutSignal::Released, PASTE_LAST, false, &mut state), Some(Event::PasteLast));
+    }
+
+    #[test]
+    fn unmatched_releases_are_harmless() {
+        let mut state = ShortcutState::default();
+        assert_eq!(handle_signal(ShortcutSignal::Released, PUSH_TO_TALK, false, &mut state), None);
+        assert_eq!(handle_signal(ShortcutSignal::Released, PUSH_TO_TALK, true, &mut state), None);
     }
 
     #[test]
